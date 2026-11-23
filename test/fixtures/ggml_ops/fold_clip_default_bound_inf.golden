@@ -1,3 +1,3 @@
 # op Clip
-in x f32 2 bfda18d5 c0225872
+in x f32 2 bf2a601e 3d963a71
 out y f32 4 7f7fffff bf800000 40400000 bf800000

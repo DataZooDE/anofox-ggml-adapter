@@ -84,6 +84,8 @@ inline const std::map<std::string, GgmlLowering> &GgmlLoweringTable() {
 	    {"ReduceProd", {GgmlLowerKind::CUSTOM, "ggml has no product reduction; host kernel"}},
 	    {"ReduceSum", {GgmlLowerKind::COMPOSITE, "ggml_sum_rows over dim 0 after permuting or merging the reduced axes"}},
 	    {"Relu", {GgmlLowerKind::NATIVE, "GGML_UNARY_OP_RELU"}},
+	    {"Flatten", {GgmlLowerKind::NATIVE, "a reshape view to [prod(dims before axis), prod(dims from axis)]"}},
+	    {"Split", {GgmlLowerKind::COMPOSITE, "one strided view per output along the axis (the same cut as Slice), made contiguous"}},
 	    {"Reshape", {GgmlLowerKind::NATIVE, "ggml_reshape_1d..4d; five- and six-dimensional shapes go through the rank-reduction pass first"}},
 	    {"Round", {GgmlLowerKind::CUSTOM, "ggml_round rounds half away from zero, ONNX rounds half to even"}},
 	    {"ScatterElements", {GgmlLowerKind::CUSTOM, "no scatter along an axis in ggml (ggml_set_rows covers rows only); host kernel"}},
@@ -112,7 +114,7 @@ inline const std::map<std::string, GgmlLowering> &GgmlLoweringTable() {
 
 //! Implemented ops (grows in P3). Always a subset of GgmlLoweringTable().
 inline const std::set<std::string> &GgmlSupportedOps() {
-	static const std::set<std::string> ops = {"Identity", "Reshape", "Squeeze", "Unsqueeze", "Neg", "Abs", "Sqrt", "Exp", "Log", "Tanh",
+	static const std::set<std::string> ops = {"Identity", "Reshape", "Flatten", "Split", "Squeeze", "Unsqueeze", "Neg", "Abs", "Sqrt", "Exp", "Log", "Tanh",
 	                                          "Add",      "Sub",     "Mul",     "Div",       "Transpose", "MatMul", "Softmax",
 	                                          "ReduceMean", "ReduceSum", "LayerNormalization", "Expand", "Concat", "Slice", "Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual", "And", "Or", "Not", "IsNaN", "IsInf", "Where",
 	                                          "Ceil", "Floor", "Round", "Sign", "Relu", "Sigmoid", "Sin", "Cos", "Softplus", "Reciprocal", "Erf", "Pow", "Max",

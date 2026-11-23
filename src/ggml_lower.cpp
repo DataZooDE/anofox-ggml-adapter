@@ -1842,8 +1842,25 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 			out = low.DoubleNode(n, plan, args, low.shapes.at(n.outputs.at(0)).dtype);
 		} else if (op == "Identity") {
 			out = in(0);
-		} else if (op == "Reshape" || op == "Squeeze" || op == "Unsqueeze") {
+		} else if (op == "Reshape" || op == "Squeeze" || op == "Unsqueeze" || op == "Flatten") {
 			out = low.Reshape(n, in(0), out_shape);
+		} else if (op == "Split") {
+			// one view per output along the axis, sized by the shape pass; each is made contiguous (Unfold regroups past four dimensions)
+			const Shape &xs = sh(0);
+			const int64_t axis = normalised_axis(n.Attr("axis") ? n.Attr("axis")->i : 0, xs.size());
+			int64_t start = 0;
+			for (size_t o = 0; o < n.outputs.size(); o++) {
+				const Shape &os = low.shapes.at(n.outputs[o]).shape;
+				ggml_tensor *view = low.SliceCuts(n, in(0), xs, {{axis, start, os[static_cast<size_t>(axis)], 1}});
+				ggml_tensor *part = low.Unfold(n, view, os);
+				start += os[static_cast<size_t>(axis)];
+				if (o == 0) {
+					out = part;
+				} else if (!n.outputs[o].empty()) {
+					low.tensors[n.outputs[o]] = part;
+					node_outs.push_back(part);
+				}
+			}
 		} else if (op == "Neg" || op == "Abs" || op == "Sqrt" || op == "Exp" || op == "Log" || op == "Tanh") {
 			ggml_tensor *x = low.Contiguous(in(0));
 			out = op == "Neg"    ? ggml_neg(ctx.get(), x)

@@ -538,6 +538,71 @@ std::vector<ShapeValue> Evaluator::Run(const Node &n, const std::vector<const Sh
 		out.shape = os;
 		return {out};
 	}
+	if (op == "Flatten") {
+		const auto &x = *in[0];
+		const int64_t rank = static_cast<int64_t>(x.shape.size());
+		int64_t axis = n.Attr("axis") ? n.Attr("axis")->i : 1;
+		axis += axis < 0 ? rank : 0;
+		if (axis < 0 || axis > rank) {
+			Fail(n, "axis out of range");
+		}
+		int64_t outer = 1, inner = 1;
+		for (int64_t i = 0; i < rank; i++) {
+			(i < axis ? outer : inner) *= x.shape[static_cast<size_t>(i)];
+		}
+		ShapeValue out = x; // the same elements in the same order
+		out.shape = {outer, inner};
+		return {out};
+	}
+	if (op == "Split") {
+		const auto &x = *in[0];
+		const int axis = AxisAttr(n, "axis", 0, x.shape.size());
+		const int64_t dim = x.shape[axis];
+		const size_t outputs = n.outputs.size();
+		std::vector<int64_t> sizes;
+		if (in.size() > 1 && in[1]) {
+			sizes = RequireInts(n, *in[1], "the split sizes");
+		} else if (n.Attr("split")) {
+			sizes = n.Attr("split")->ints;
+		} else {
+			// equal parts; with num_outputs (opset 18) the last part may be smaller: ceil(dim / outputs) each
+			const int64_t parts = n.Attr("num_outputs") ? n.Attr("num_outputs")->i : static_cast<int64_t>(outputs);
+			if (parts <= 0) {
+				Fail(n, "num_outputs must be positive");
+			}
+			const int64_t chunk = (dim + parts - 1) / parts;
+			for (int64_t o = 0; o < dim; o += chunk) {
+				sizes.push_back(std::min(chunk, dim - o));
+			}
+		}
+		if (sizes.size() != outputs) {
+			Fail(n, "the split gives " + std::to_string(sizes.size()) + " parts for " + std::to_string(outputs) + " outputs");
+		}
+		int64_t total = 0;
+		for (auto sz : sizes) {
+			if (sz < 0) {
+				Fail(n, "a split size is negative");
+			}
+			total += sz;
+		}
+		if (total != dim) {
+			Fail(n, "the split sizes add up to " + std::to_string(total) + ", the axis has " + std::to_string(dim));
+		}
+		std::vector<ShapeValue> outs;
+		const Shape st = StridesOf(x.shape);
+		int64_t start = 0;
+		for (auto sz : sizes) {
+			Shape os = x.shape;
+			os[axis] = sz;
+			if (!x.known) {
+				outs.push_back(Unknown(os, x.dtype));
+			} else {
+				outs.push_back(Gathered(x, StridedIndex(os, st, start * st[axis]), os));
+			}
+			start += sz;
+		}
+		return outs;
+	}
 	if (op == "Squeeze" || op == "Unsqueeze") {
 		const auto &x = *in[0];
 		std::vector<int64_t> axes;

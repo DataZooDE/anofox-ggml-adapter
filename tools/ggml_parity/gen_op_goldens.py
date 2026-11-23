@@ -639,6 +639,26 @@ case("int_div_truncates", "Div", {"x": ints6}, nodes=[
 case("int_div_two_runtime_ints", "Div", {"x": ints6, "d": np.array([2, 2, -2, -2, 3, 3, 4, -1], np.float32)}, nodes=[
     helper.make_node("Cast", ["x"], ["xi"], to=TensorProto.INT64), helper.make_node("Cast", ["d"], ["di"], to=TensorProto.INT64),
     helper.make_node("Div", ["xi", "di"], ["q"]), helper.make_node("Cast", ["q"], ["y"], to=TensorProto.FLOAT)])
+# --- Flatten (encoder heads flatten [B, M, H] for the scorer) ---
+for tag, shape, axis in [("axis0", (2, 3, 4), 0), ("default", (2, 3, 4), None), ("axis2", (2, 3, 4), 2), ("neg1", (2, 3, 4), -1),
+                         ("rank4_axis2", (2, 3, 2, 5), 2), ("rank5_axis3", (2, 1, 3, 2, 2), 3)]:
+    case(f"flatten_{tag}", "Flatten", {"x": spiked(*shape)}, **({} if axis is None else {"axis": axis}))
+
+# --- Split (an encoder splits its fused Wqkv projection into q, k, v). Several outputs: the case concatenates them in another order,
+# so every output is checked ---
+def split_case(name, x, outputs, axis, inits=None, **attrs):
+    parts = [f"p{i}" for i in range(outputs)]
+    split_in = ["x"] + (["split"] if inits and "split" in inits else [])
+    order = parts[::-1]
+    case(name, "Split", {"x": x}, inits=inits, nodes=[
+        helper.make_node("Split", split_in, parts, axis=axis, **attrs),
+        helper.make_node("Concat", order, ["y"], axis=axis)])
+split_case("split_qkv_equal", spiked(2, 5, 12), 3, -1, num_outputs=3)
+split_case("split_sizes_input", spiked(3, 7), 3, 1, inits={"split": np.array([1, 2, 4], np.int64)})
+split_case("split_axis0", spiked(6, 2, 2), 2, 0, inits={"split": np.array([2, 4], np.int64)})
+split_case("split_uneven_num_outputs", spiked(2, 7), 3, 1, num_outputs=3)   # opset 18: 3, 3, 1
+split_case("split_rank5", spiked(2, 1, 3, 2, 6), 2, 4, num_outputs=2)
+
 # int64 GRAPH INPUTS fed as data (token ids, masks, positions in an encoder graph): their integer semantics come from the graph's input
 # type, not from a Cast inside the graph
 case("int_input_div_truncates", "Div", {"a": np.array([5, -7, 9, -9, 0, 7], np.int64), "b": np.array([2, 2, 4, 4, 3, -2], np.int64)})
