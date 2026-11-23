@@ -14,11 +14,12 @@
 #   ANOFOX_GGML_NATIVE    (option)      compile ggml for this machine's CPU (fast, may crash on older CPUs). Default OFF (ON on MSVC arm64,
 #                                       where ggml-cpu requires it).
 # Sets:
-#   ANOFOX_GGML_ADAPTER_SOURCES, ANOFOX_GGML_ADAPTER_INCLUDE_DIR, target anofox_ggml (INTERFACE IMPORTED GLOBAL).
+#   ANOFOX_GGML_ADAPTER_SOURCES, ANOFOX_GGML_ADAPTER_INCLUDE_DIR, target anofox_ggml (INTERFACE IMPORTED GLOBAL: the CPU archives; a GPU
+#   consumer links the `ggml` target itself, which carries its GPU backend).
 
-if(TARGET anofox_ggml)
-    return()
-endif()
+# The variables are set for every includer (they are directory-scoped); the targets are created once (they are global). One CMake
+# tree that builds two consumers (e.g. two extensions in one DuckDB build) therefore shares the first includer's ggml and adapter; each
+# consumer compiles the engine sources into its own binary.
 get_filename_component(ANOFOX_GGML_ADAPTER_DIR "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 set(ANOFOX_GGML_ADAPTER_INCLUDE_DIR "${ANOFOX_GGML_ADAPTER_DIR}/include")
 set(ANOFOX_GGML_ADAPTER_SOURCES
@@ -27,6 +28,9 @@ set(ANOFOX_GGML_ADAPTER_SOURCES
     "${ANOFOX_GGML_ADAPTER_DIR}/src/onnx_reader.cpp"
     "${ANOFOX_GGML_ADAPTER_DIR}/src/ggml_engine.cpp"
     "${ANOFOX_GGML_ADAPTER_DIR}/src/cpu_support.cpp")
+if(TARGET anofox_ggml)
+    return()
+endif()
 
 if(NOT DEFINED ANOFOX_GGML_CPU_ONLY)
     set(ANOFOX_GGML_CPU_ONLY ON)

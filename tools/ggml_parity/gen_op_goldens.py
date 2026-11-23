@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["onnx", "onnxruntime", "numpy"]
+# dependencies = ["onnx==1.23.2", "onnxruntime==1.32.0", "numpy==2.5.5"]
 # ///
 """Per-op goldens for the ggml CPU engine (docs/GGML_PLAN.md, P3), from ONNX Runtime (the oracle).
 

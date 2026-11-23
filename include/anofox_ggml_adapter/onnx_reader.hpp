@@ -1,5 +1,5 @@
 /*===----------------------------------------------------------------------===
- *                         anofox-tabfm
+ *                         anofox-ggml-adapter
  *
  * onnx_reader.hpp — just enough ONNX to execute a graph.
  *
