@@ -1635,6 +1635,12 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 			leaf(t.name, Shape(t.dims.begin(), t.dims.end()), external.data);
 			return;
 		}
+		if (t.data_type == 1 && !t.raw.empty() && t.raw.size() >= count * 4 && reinterpret_cast<uintptr_t>(t.raw.data()) % alignof(float) == 0) {
+			// float32 raw bytes of the parsed graph, which outlives the executor: the leaf reads them in place, so a full graph's weights are
+			// not copied once per compiled shape (a 1.7 GB encoder held another 1.7 GB per cached shape)
+			leaf(t.name, Shape(t.dims.begin(), t.dims.end()), reinterpret_cast<const float *>(t.raw.data()));
+			return;
+		}
 		std::vector<float> values(count);
 		if (!t.raw.empty()) {
 			if (t.raw.size() < count * 4) {
@@ -1770,6 +1776,32 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 			low.sequences[n.outputs.at(0)] = seq;
 			continue;
 		}
+		if (op == "Split") {
+			// One view per output along the axis, sized by the shape pass; Unfold regroups a view past four dimensions. A zero-size part
+			// holds nothing and is not lowered (like any empty tensor: Concat, its only consumer, drops it).
+			const Shape &xs = shape_of(n, n.inputs.at(0));
+			int64_t axis = n.Attr("axis") ? n.Attr("axis")->i : 0;
+			axis += axis < 0 ? static_cast<int64_t>(xs.size()) : 0;
+			if (axis < 0 || axis >= static_cast<int64_t>(xs.size())) {
+				Fail(n, "axis out of range");
+			}
+			int64_t start = 0;
+			for (const auto &name : n.outputs) {
+				if (name.empty()) {
+					Fail(n, "a Split output without a name is not supported");
+				}
+				const Shape &os = shape_of(n, name);
+				const int64_t size = os[static_cast<size_t>(axis)];
+				if (Numel(os) != 0) {
+					ggml_tensor *view = low.SliceCuts(n, tensor_of(n, n.inputs.at(0)), xs, {{axis, start, size, 1}});
+					ggml_tensor *part = low.Unfold(n, view, os);
+					low.tensors[name] = part;
+					node_outs.push_back(part);
+				}
+				start += size;
+			}
+			continue;
+		}
 		const Shape &out_shape = shape_of(n, n.outputs.at(0));
 		if (Numel(out_shape) == 0) {
 			continue; // an empty tensor holds nothing; the only consumer that accepts one is Concat (below), which drops it
@@ -1810,7 +1842,7 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 			// Only ops the shape pass's interpreter evaluates with real values can run on a double tensor; anything else would hand the
 			// kernel an unknown value at inference time, so it is refused here by name.
 			static const std::set<std::string> kDoubleOps = {
-			    "Cast", "CastLike", "Identity", "Reshape", "Squeeze", "Unsqueeze", "Transpose", "Expand", "Concat", "Slice", "Gather",
+			    "Cast", "CastLike", "Identity", "Reshape", "Squeeze", "Unsqueeze", "Flatten", "Transpose", "Expand", "Concat", "Slice", "Gather",
 			    "Add", "Sub", "Mul", "Div", "Pow", "Mod", "Max", "Min", "Neg", "Abs", "Sqrt", "Reciprocal", "Exp", "Log", "Tanh", "Erf",
 			    "Sigmoid", "Ceil", "Floor", "Sin", "Cos", "Round", "Relu", "Sign", "Softplus", "Where", "Clip", "Equal", "Less",
 			    "LessOrEqual", "Greater", "GreaterOrEqual", "And", "Or", "Not", "IsNaN", "IsInf"};
@@ -1844,23 +1876,6 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 			out = in(0);
 		} else if (op == "Reshape" || op == "Squeeze" || op == "Unsqueeze" || op == "Flatten") {
 			out = low.Reshape(n, in(0), out_shape);
-		} else if (op == "Split") {
-			// one view per output along the axis, sized by the shape pass; each is made contiguous (Unfold regroups past four dimensions)
-			const Shape &xs = sh(0);
-			const int64_t axis = normalised_axis(n.Attr("axis") ? n.Attr("axis")->i : 0, xs.size());
-			int64_t start = 0;
-			for (size_t o = 0; o < n.outputs.size(); o++) {
-				const Shape &os = low.shapes.at(n.outputs[o]).shape;
-				ggml_tensor *view = low.SliceCuts(n, in(0), xs, {{axis, start, os[static_cast<size_t>(axis)], 1}});
-				ggml_tensor *part = low.Unfold(n, view, os);
-				start += os[static_cast<size_t>(axis)];
-				if (o == 0) {
-					out = part;
-				} else if (!n.outputs[o].empty()) {
-					low.tensors[n.outputs[o]] = part;
-					node_outs.push_back(part);
-				}
-			}
 		} else if (op == "Neg" || op == "Abs" || op == "Sqrt" || op == "Exp" || op == "Log" || op == "Tanh") {
 			ggml_tensor *x = low.Contiguous(in(0));
 			out = op == "Neg"    ? ggml_neg(ctx.get(), x)
@@ -2912,6 +2927,17 @@ void GgmlExecutor::Trim() {
 size_t GgmlExecutor::CompileCount() const {
 	std::lock_guard<std::mutex> guard(impl_->mutex);
 	return impl_->compiles;
+}
+
+size_t GgmlExecutor::InitializerCopyBytes() const {
+	std::lock_guard<std::mutex> guard(impl_->mutex);
+	size_t bytes = 0;
+	for (const auto &compiled : impl_->cache) {
+		for (const auto &v : compiled->initializer_floats) {
+			bytes += v.size() * sizeof(float);
+		}
+	}
+	return bytes;
 }
 
 HostTensors GgmlRunGraph(const ::anofox::onnxread::Graph &graph, const HostTensors &inputs, const GgmlRunOptions &options) {

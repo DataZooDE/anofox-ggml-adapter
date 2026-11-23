@@ -557,6 +557,9 @@ std::vector<ShapeValue> Evaluator::Run(const Node &n, const std::vector<const Sh
 	if (op == "Split") {
 		const auto &x = *in[0];
 		const int axis = AxisAttr(n, "axis", 0, x.shape.size());
+		if (axis < 0 || axis >= static_cast<int>(x.shape.size())) {
+			Fail(n, "axis out of range");
+		}
 		const int64_t dim = x.shape[axis];
 		const size_t outputs = n.outputs.size();
 		std::vector<int64_t> sizes;
@@ -565,14 +568,19 @@ std::vector<ShapeValue> Evaluator::Run(const Node &n, const std::vector<const Sh
 		} else if (n.Attr("split")) {
 			sizes = n.Attr("split")->ints;
 		} else {
-			// equal parts; with num_outputs (opset 18) the last part may be smaller: ceil(dim / outputs) each
+			// equal parts; with num_outputs (opset 18) every part is ceil(dim / parts) and the last takes the rest, which may be smaller or
+			// even 0 (ONNX's shape inference and reference implementation)
 			const int64_t parts = n.Attr("num_outputs") ? n.Attr("num_outputs")->i : static_cast<int64_t>(outputs);
 			if (parts <= 0) {
 				Fail(n, "num_outputs must be positive");
 			}
 			const int64_t chunk = (dim + parts - 1) / parts;
-			for (int64_t o = 0; o < dim; o += chunk) {
-				sizes.push_back(std::min(chunk, dim - o));
+			for (int64_t o = 0; o + 1 < parts; o++) {
+				sizes.push_back(chunk);
+			}
+			sizes.push_back(dim - chunk * (parts - 1));
+			if (sizes.back() < 0) {
+				Fail(n, "num_outputs " + std::to_string(parts) + " cannot split an axis of " + std::to_string(dim));
 			}
 		}
 		if (sizes.size() != outputs) {

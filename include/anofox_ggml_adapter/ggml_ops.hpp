@@ -85,7 +85,7 @@ inline const std::map<std::string, GgmlLowering> &GgmlLoweringTable() {
 	    {"ReduceSum", {GgmlLowerKind::COMPOSITE, "ggml_sum_rows over dim 0 after permuting or merging the reduced axes"}},
 	    {"Relu", {GgmlLowerKind::NATIVE, "GGML_UNARY_OP_RELU"}},
 	    {"Flatten", {GgmlLowerKind::NATIVE, "a reshape view to [prod(dims before axis), prod(dims from axis)]"}},
-	    {"Split", {GgmlLowerKind::COMPOSITE, "one strided view per output along the axis (the same cut as Slice), made contiguous"}},
+	    {"Split", {GgmlLowerKind::COMPOSITE, "one strided view per output along the axis (the same cut as Slice); zero-size parts are not lowered"}},
 	    {"Reshape", {GgmlLowerKind::NATIVE, "ggml_reshape_1d..4d; five- and six-dimensional shapes go through the rank-reduction pass first"}},
 	    {"Round", {GgmlLowerKind::CUSTOM, "ggml_round rounds half away from zero, ONNX rounds half to even"}},
 	    {"ScatterElements", {GgmlLowerKind::CUSTOM, "no scatter along an axis in ggml (ggml_set_rows covers rows only); host kernel"}},

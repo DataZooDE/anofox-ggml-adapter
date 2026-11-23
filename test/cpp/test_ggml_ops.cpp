@@ -877,3 +877,35 @@ TEST_CASE("ggml_executor: token ids as data index a 256k embedding exactly, and 
 	}
 	REQUIRE(executor.CompileCount() == 1);
 }
+
+// A full graph's weights are inline initializers. Every input shape compiles its own graph, and each used to decode its own float copy of
+// every weight: a 1.7 GB encoder held 1.7 GB more per cached shape. Float32 inline weights are read in place from the parsed graph instead.
+TEST_CASE("ggml_executor: inline float weights are read in place, not copied per compiled shape", "[adapter][ggml][ggml_ops]") {
+	::anofox::onnxread::Graph g;
+	g.inputs = {"x"};
+	::anofox::onnxread::Tensor w;
+	w.name = "w";
+	w.dims = {4, 3};
+	w.data_type = 1;
+	std::vector<float> wv(12);
+	for (size_t i = 0; i < wv.size(); i++) {
+		wv[i] = 0.5f * static_cast<float>(i);
+	}
+	w.raw.assign(reinterpret_cast<const char *>(wv.data()), wv.size() * sizeof(float));
+	g.initializers.push_back(w);
+	g.nodes = {MakeNode("MatMul", {"x", "w"}, "y")};
+	g.outputs = {"y"};
+	GgmlExecutorConfig config;
+	config.threads = 2;
+	config.cache_entries = 4;
+	GgmlExecutor executor(g, config);
+	for (int64_t rows : {1, 2, 3}) {
+		HostTensors in;
+		in["x"] = HostTensor {{rows, 4}, std::vector<float>(static_cast<size_t>(rows * 4), 1.0f)};
+		const auto out = executor.Run(in, GgmlRunOptions {});
+		REQUIRE(out.at("y").shape == std::vector<int64_t> {rows, 3});
+		REQUIRE(out.at("y").data[0] == 0.5f * (0 + 3 + 6 + 9)); // column 0 of w summed
+	}
+	REQUIRE(executor.CompileCount() == 3);
+	REQUIRE(executor.InitializerCopyBytes() == 0);
+}

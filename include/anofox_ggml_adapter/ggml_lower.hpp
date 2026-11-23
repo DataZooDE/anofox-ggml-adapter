@@ -110,6 +110,8 @@ public:
 
 	//! Number of graphs compiled so far (a test hook: a repeated signature must not recompile).
 	size_t CompileCount() const;
+	//! Bytes of initializer copies the cached compiled graphs hold (inline weights the lowering had to decode; float32 ones are read in place).
+	size_t InitializerCopyBytes() const;
 
 private:
 	struct Impl;

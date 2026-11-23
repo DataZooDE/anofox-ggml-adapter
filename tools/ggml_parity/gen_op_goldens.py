@@ -660,6 +660,12 @@ split_case("split_sizes_input", spiked(3, 7), 3, 1, inits={"split": np.array([1,
 split_case("split_axis0", spiked(6, 2, 2), 2, 0, inits={"split": np.array([2, 4], np.int64)})
 split_case("split_uneven_num_outputs", spiked(2, 7), 3, 1, num_outputs=3)   # opset 18: 3, 3, 1
 split_case("split_rank5", spiked(2, 1, 3, 2, 6), 2, 4, num_outputs=2)
+# a zero-size part (allowed by ONNX), first and last; the ONNX num_outputs rule: ceil(4 / 3) = 2 -> 2, 2, 0
+split_case("split_empty_first", spiked(2, 4), 2, 1, inits={"split": np.array([0, 4], np.int64)})
+split_case("split_empty_middle", spiked(2, 5), 3, 1, inits={"split": np.array([2, 0, 3], np.int64)})
+split_case("split_num_outputs_empty_last", spiked(2, 4), 3, 1, num_outputs=3)
+# a part that is itself the graph output (no consumer inside the graph)
+case("split_part_is_output", "Split", {"x": spiked(3, 6)}, nodes=[helper.make_node("Split", ["x"], ["a", "y"], axis=1, num_outputs=2)])
 
 # int64 GRAPH INPUTS fed as data (token ids, masks, positions in an encoder graph): their integer semantics come from the graph's input
 # type, not from a Cast inside the graph
