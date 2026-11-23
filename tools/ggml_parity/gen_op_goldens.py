@@ -703,4 +703,9 @@ case("scatternd_empty_indices", "ScatterND", {"d": spiked(4, 3), "u": np.zeros((
 case("scatterelements_empty_indices", "ScatterElements", {"d": spiked(3, 4), "u": np.zeros((3, 0), np.float32)}, nodes=[helper.make_node("ScatterElements", ["d", "i", "u"], ["y"], axis=1)],
      inits={"i": np.zeros((3, 0), np.int64)})
 
+# Cases added after this point keep the inputs of every earlier case (the generator draws from one RNG in file order).
+# a zero-size part that is the graph output: ONNX Runtime returns an empty tensor of that shape
+case("split_empty_part_is_output", "Split", {"x": spiked(3, 6)}, inits={"split": np.array([6, 0], np.int64)},
+     nodes=[helper.make_node("Split", ["x", "split"], ["a", "y"], axis=1)])
+
 print(len(os.listdir(OUT)) // 2, "cases in", os.path.normpath(OUT))

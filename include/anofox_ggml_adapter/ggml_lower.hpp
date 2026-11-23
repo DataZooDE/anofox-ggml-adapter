@@ -89,6 +89,8 @@ std::vector<std::string> GgmlDeviceNames();
 
 class GgmlExecutor {
 public:
+	//! `graph` must outlive the executor and stay where it is (not moved, copied over or edited): the compiled graphs read its float32
+	//! initializers in place on every run, so a full model's weights are not copied once per cached shape.
 	GgmlExecutor(const ::anofox::onnxread::Graph &graph, GgmlExecutorConfig config);
 	~GgmlExecutor();
 	GgmlExecutor(const GgmlExecutor &) = delete;

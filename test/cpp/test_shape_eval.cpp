@@ -421,6 +421,12 @@ TEST_CASE("shape_eval: invalid graphs are refused, not read out of bounds", "[ad
 	refused(g, "-1");
 	g.nodes = {Const("x", Int64Tensor({2}, {1, 2})), Op("Cast", {"x"}, {"y"})};
 	refused(g, "to");
+	// Split with neither sizes nor num_outputs splits into equal parts only (opset 13: an uneven split is invalid, not 2, 2, 0)
+	g.nodes = {Const("x", Int64Tensor({4}, {1, 2, 3, 4})), Op("Split", {"x"}, {"a", "b", "c"})};
+	refused(g, "equal parts");
+	// sizes AND num_outputs is invalid ONNX: refused, not one of them silently preferred
+	g.nodes = {Const("x", Int64Tensor({4}, {1, 2, 3, 4})), Const("s", Int64Tensor({2}, {1, 3})), WithInt(Op("Split", {"x", "s"}, {"a", "b"}), "num_outputs", 2)};
+	refused(g, "num_outputs");
 }
 
 TEST_CASE("shape_eval: huge tensors are not materialised", "[adapter][shape_eval]") {

@@ -563,6 +563,10 @@ std::vector<ShapeValue> Evaluator::Run(const Node &n, const std::vector<const Sh
 		const int64_t dim = x.shape[axis];
 		const size_t outputs = n.outputs.size();
 		std::vector<int64_t> sizes;
+		const bool has_sizes = (in.size() > 1 && in[1]) || n.Attr("split");
+		if (has_sizes && n.Attr("num_outputs")) {
+			Fail(n, "split sizes and num_outputs are both given (ONNX allows one)");
+		}
 		if (in.size() > 1 && in[1]) {
 			sizes = RequireInts(n, *in[1], "the split sizes");
 		} else if (n.Attr("split")) {
@@ -573,6 +577,11 @@ std::vector<ShapeValue> Evaluator::Run(const Node &n, const std::vector<const Sh
 			const int64_t parts = n.Attr("num_outputs") ? n.Attr("num_outputs")->i : static_cast<int64_t>(outputs);
 			if (parts <= 0) {
 				Fail(n, "num_outputs must be positive");
+			}
+			if (!n.Attr("num_outputs") && dim % parts != 0) {
+				// before opset 18 (no num_outputs) the parts must be equal: an uneven split is an invalid graph
+				Fail(n, "without split sizes or num_outputs the axis of " + std::to_string(dim) + " splits into equal parts only, not " +
+				            std::to_string(parts));
 			}
 			const int64_t chunk = (dim + parts - 1) / parts;
 			for (int64_t o = 0; o + 1 < parts; o++) {

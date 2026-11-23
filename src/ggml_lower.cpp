@@ -2335,6 +2335,14 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 				host_outputs[name] = std::move(h);
 				continue;
 			}
+			if (sv != low.shapes.end() && Numel(sv->second.shape) == 0) {
+				// a zero-size output (a Split part of size 0, say) is never lowered: it is returned empty, with its shape, as ONNX
+				// Runtime returns it
+				HostTensor h;
+				h.shape = sv->second.shape;
+				host_outputs[name] = std::move(h);
+				continue;
+			}
 			if (sv == low.shapes.end() || !sv->second.known) {
 				throw std::runtime_error("ggml lowering: graph output '" + name + "' is not a tensor the engine computed");
 			}
