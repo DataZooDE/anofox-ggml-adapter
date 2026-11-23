@@ -162,7 +162,9 @@ for op in ["ReduceMean", "ReduceSum"]:
     case(f"{tag}_last_drop", op, {"x": spiked(3, 5)}, inits={"axes": ax(-1)}, keepdims=0)
     case(f"{tag}_first", op, {"x": spiked(3, 5)}, inits={"axes": ax(0)})
     case(f"{tag}_mid", op, {"x": rand(2, 3, 4)}, inits={"axes": ax(1)})
-    case(f"{tag}_two_axes", op, {"x": rand(2, 3, 4)}, inits={"axes": ax(0, 2)}, keepdims=0)
+    # values on a 1/16 grid: their sums are exact in float32 whatever order a CPU's SIMD width adds them in, so the golden is the same on
+    # every machine (ONNX Runtime's reduction order differs between AVX2 and AVX-512)
+    case(f"{tag}_two_axes", op, {"x": (np.round(rand(2, 3, 4) * 16) / 16).astype(np.float32)}, inits={"axes": ax(0, 2)}, keepdims=0)
     case(f"{tag}_all", op, {"x": rand(2, 3, 4)})
     case(f"{tag}_rank4", op, {"x": rand(2, 3, 4, 5)}, inits={"axes": ax(2)})
 case("layernorm_last", "LayerNormalization", {"x": rand(3, 6)}, inits={"scale": rand(6), "bias": rand(6)}, axis=-1, epsilon=1e-5)
