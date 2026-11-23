@@ -831,3 +831,49 @@ TEST_CASE("ggml_executor: views of an input follow the input to each call's buff
 	}
 	REQUIRE(executor.CompileCount() == 1);
 }
+
+// An encoder graph's token ids are DATA (int64, one value per token, vocabularies of 256k): an embedding lookup over them must return exact
+// rows for every id up to the vocabulary size, and a new batch of ids with the same shape must reuse the compiled graph (the values are not
+// part of the signature, unlike host-folded int_inputs).
+TEST_CASE("ggml_executor: token ids as data index a 256k embedding exactly, and new ids do not recompile", "[adapter][ggml][ggml_ops]") {
+	const int64_t vocab = 256000, dim = 4;
+	std::vector<float> table(static_cast<size_t>(vocab * dim));
+	for (int64_t r = 0; r < vocab; r++) {
+		for (int64_t c = 0; c < dim; c++) {
+			table[static_cast<size_t>(r * dim + c)] = static_cast<float>(r) + 0.25f * static_cast<float>(c);
+		}
+	}
+	::anofox::onnxread::Graph g;
+	g.inputs = {"ids"};
+	g.input_types["ids"] = 7; // int64
+	::anofox::onnxread::Tensor emb;
+	emb.name = "emb";
+	emb.dims = {vocab, dim};
+	emb.data_type = 1;
+	emb.location = ::anofox::onnxread::DataLocation::EXTERNAL;
+	g.initializers.push_back(emb);
+	g.nodes = {MakeNode("Gather", {"emb", "ids"}, "y")};
+	g.outputs = {"y"};
+	GgmlExecutorConfig config;
+	config.threads = 3;
+	config.weights = [&](const std::string &, const std::vector<int64_t> &) {
+		return ExternalWeight {table.data(), table.size(), 1};
+	};
+	GgmlExecutor executor(g, config);
+	for (const std::vector<int64_t> &ids : {std::vector<int64_t> {0, 1, 255999, 128000, 7, 65536}, std::vector<int64_t> {3, 255998, 2, 9, 200001, 16777}}) {
+		HostTensors in;
+		in["ids"] = HostTensor {{2, 3}, {}};
+		for (auto id : ids) {
+			in["ids"].data.push_back(static_cast<float>(id));
+		}
+		const auto out = executor.Run(in, GgmlRunOptions {});
+		const auto &y = out.at("y");
+		REQUIRE(y.shape == std::vector<int64_t> {2, 3, dim});
+		for (size_t i = 0; i < ids.size(); i++) {
+			for (int64_t c = 0; c < dim; c++) {
+				REQUIRE(y.data[i * dim + static_cast<size_t>(c)] == static_cast<float>(ids[i]) + 0.25f * static_cast<float>(c));
+			}
+		}
+	}
+	REQUIRE(executor.CompileCount() == 1);
+}

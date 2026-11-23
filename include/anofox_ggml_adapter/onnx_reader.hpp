@@ -88,6 +88,9 @@ struct Graph {
 	std::vector<Tensor> initializers;
 	std::vector<std::string> inputs;
 	std::vector<std::string> outputs;
+	//! The element type (TensorProto data_type: 1 float, 7 int64, 6 int32, 9 bool, ...) of each graph input that declares one. An integer
+	//! input fed as data (token ids, masks, positions) keeps its integer semantics through it.
+	std::map<std::string, int32_t> input_types;
 };
 
 //! Parse an ONNX model file. Throws std::runtime_error naming the file.

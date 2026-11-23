@@ -1478,6 +1478,17 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 		}
 		if (options.bool_inputs.count(name)) {
 			sin.dtypes[name] = ShapeDtype::BOOL;
+		} else {
+			// an integer or bool input fed as data keeps the semantics its declared type gives it (an integer Div truncates)
+			const auto declared = graph.input_types.find(name);
+			if (declared != graph.input_types.end()) {
+				const int32_t t = declared->second;
+				if (t == 7 || t == 6 || t == 5 || t == 3 || t == 12 || t == 13 || t == 4 || t == 2) { // int64, int32, int16, int8, uint32/64/16/8
+					sin.dtypes[name] = ShapeDtype::I64;
+				} else if (t == 9) {
+					sin.dtypes[name] = ShapeDtype::BOOL;
+				}
+			}
 		}
 		const auto it = inputs.find(name);
 		if (it == inputs.end()) {

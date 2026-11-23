@@ -280,17 +280,52 @@ Node ParseNode(Reader r) {
 	return n;
 }
 
-std::string ParseValueInfoName(Reader r) {
+//! Field `field` (a length-delimited message) of the message `r`, or an empty reader when it is absent.
+bool FindSub(Reader r, uint32_t want, Reader &out) {
+	while (!r.Done()) {
+		const uint64_t tag = r.Varint();
+		const uint32_t field = static_cast<uint32_t>(tag >> 3);
+		const uint32_t wire = static_cast<uint32_t>(tag & 7);
+		if (field == want && wire == 2) {
+			out = r.Sub();
+			return true;
+		}
+		r.Skip(wire);
+	}
+	return false;
+}
+
+//! ValueInfoProto: name (1) and, through type (2) -> tensor_type (1) -> elem_type (1), its element type (0 when not declared).
+std::pair<std::string, int32_t> ParseValueInfo(Reader r) {
+	std::string name;
+	int32_t elem_type = 0;
 	while (!r.Done()) {
 		const uint64_t tag = r.Varint();
 		const uint32_t field = static_cast<uint32_t>(tag >> 3);
 		const uint32_t wire = static_cast<uint32_t>(tag & 7);
 		if (field == 1 && wire == 2) {
-			return r.Bytes();
+			name = r.Bytes();
+		} else if (field == 2 && wire == 2) {
+			Reader tensor_type(nullptr, nullptr);
+			if (FindSub(r.Sub(), 1, tensor_type)) {
+				while (!tensor_type.Done()) {
+					const uint64_t t2 = tensor_type.Varint();
+					if ((t2 >> 3) == 1 && (t2 & 7) == 0) {
+						elem_type = static_cast<int32_t>(tensor_type.Varint());
+					} else {
+						tensor_type.Skip(static_cast<uint32_t>(t2 & 7));
+					}
+				}
+			}
+		} else {
+			r.Skip(wire);
 		}
-		r.Skip(wire);
 	}
-	return {};
+	return {name, elem_type};
+}
+
+std::string ParseValueInfoName(Reader r) {
+	return ParseValueInfo(r).first;
 }
 
 Graph ParseGraph(Reader r) {
@@ -306,9 +341,14 @@ Graph ParseGraph(Reader r) {
 		case 5:
 			g.initializers.push_back(ParseTensor(r.Sub()));
 			break;
-		case 11:
-			g.inputs.push_back(ParseValueInfoName(r.Sub()));
+		case 11: {
+			auto info = ParseValueInfo(r.Sub());
+			if (info.second != 0) {
+				g.input_types[info.first] = info.second;
+			}
+			g.inputs.push_back(std::move(info.first));
 			break;
+		}
 		case 12:
 			g.outputs.push_back(ParseValueInfoName(r.Sub()));
 			break;

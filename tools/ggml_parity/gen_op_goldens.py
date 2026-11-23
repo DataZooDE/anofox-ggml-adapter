@@ -639,6 +639,12 @@ case("int_div_truncates", "Div", {"x": ints6}, nodes=[
 case("int_div_two_runtime_ints", "Div", {"x": ints6, "d": np.array([2, 2, -2, -2, 3, 3, 4, -1], np.float32)}, nodes=[
     helper.make_node("Cast", ["x"], ["xi"], to=TensorProto.INT64), helper.make_node("Cast", ["d"], ["di"], to=TensorProto.INT64),
     helper.make_node("Div", ["xi", "di"], ["q"]), helper.make_node("Cast", ["q"], ["y"], to=TensorProto.FLOAT)])
+# int64 GRAPH INPUTS fed as data (token ids, masks, positions in an encoder graph): their integer semantics come from the graph's input
+# type, not from a Cast inside the graph
+case("int_input_div_truncates", "Div", {"a": np.array([5, -7, 9, -9, 0, 7], np.int64), "b": np.array([2, 2, 4, 4, 3, -2], np.int64)})
+case("int_input_add_then_div", "Div", {"a": np.array([[1, 2, 3], [4, 5, 6]], np.int64)}, nodes=[
+    helper.make_node("Add", ["a", "one"], ["s"]), helper.make_node("Div", ["s", "two"], ["y"])],
+    inits={"one": np.array(1, np.int64), "two": np.array(2, np.int64)})
 case("int_reducemean_truncates", "ReduceMean", {"x": np.array([[1, 2, 2], [-1, -2, -2], [5, 5, 6]], np.float32)}, nodes=[
     helper.make_node("Cast", ["x"], ["xi"], to=TensorProto.INT64), helper.make_node("ReduceMean", ["xi", "ax"], ["m"], keepdims=0),
     helper.make_node("Cast", ["m"], ["y"], to=TensorProto.FLOAT)], inits={"ax": ax(-1)})
