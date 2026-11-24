@@ -1,11 +1,13 @@
 // The generic ggml plugin (src/plugin_ggml.cpp), built in its CPU test mode so CI runs the real plugin end to end without a GPU: the
 // same create/run code the CUDA and ROCm builds run, the same host-weight path, only the executor's device differs.
+// On a GPU machine the same assertions run against a GPU build: ANOFOX_GGML_TEST_PLUGIN=<libanofox_ggml-cuda_plugin.so> ./adapter_tests "[plugin]"
 
 #include "catch.hpp"
 
 #include "anofox_ggml_adapter/plugin_host.hpp"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -17,6 +19,12 @@ using namespace anofox::ggml_adapter;
 #endif
 
 namespace {
+
+//! The plugin under test: the CPU build, or the GPU build named by ANOFOX_GGML_TEST_PLUGIN.
+const char *PluginPath() {
+	const char *env = std::getenv("ANOFOX_GGML_TEST_PLUGIN");
+	return env && *env ? env : ANOFOX_GGML_CPU_PLUGIN;
+}
 
 uint16_t FloatToHalf(float f) { // exact for the small integers and halves used here
 	uint32_t x;
@@ -79,7 +87,7 @@ std::vector<PluginTensor> Inputs(const std::vector<float> &x, const std::vector<
 
 TEST_CASE("plugin_ggml: the generic plugin runs a graph whose weights the host supplies by name", "[adapter][plugin]") {
 	Fixture f;
-	auto session = PluginSession::Open(ANOFOX_GGML_CPU_PLUGIN, f.Params());
+	auto session = PluginSession::Open(PluginPath(), f.Params());
 	REQUIRE(session->Name() == "ggml");
 	REQUIRE(session->GraphInputs() == std::vector<std::string> {"x", "ids", "mask", "k"});
 
@@ -109,13 +117,13 @@ TEST_CASE("plugin_ggml: the graph may come as bytes, and a missing or misshapen 
 	p.graph_path.clear();
 	p.graph_data = bytes.data();
 	p.graph_size = bytes.size();
-	auto session = PluginSession::Open(ANOFOX_GGML_CPU_PLUGIN, p);
+	auto session = PluginSession::Open(PluginPath(), p);
 	REQUIRE(session->GraphInputs().size() == 4);
 
 	auto missing = f.Params();
 	missing.weights.pop_back();
 	try {
-		PluginSession::Open(ANOFOX_GGML_CPU_PLUGIN, missing);
+		PluginSession::Open(PluginPath(), missing);
 		FAIL("expected a refusal");
 	} catch (const PluginError &e) {
 		REQUIRE(e.kind == PluginError::Kind::CREATE_FAILED);
@@ -124,7 +132,7 @@ TEST_CASE("plugin_ggml: the graph may come as bytes, and a missing or misshapen 
 	auto wrong = f.Params();
 	wrong.weights[0].count = 11;
 	try {
-		PluginSession::Open(ANOFOX_GGML_CPU_PLUGIN, wrong);
+		PluginSession::Open(PluginPath(), wrong);
 		FAIL("expected a refusal");
 	} catch (const PluginError &e) {
 		REQUIRE(e.kind == PluginError::Kind::CREATE_FAILED);
@@ -133,7 +141,7 @@ TEST_CASE("plugin_ggml: the graph may come as bytes, and a missing or misshapen 
 	auto bf = f.Params();
 	bf.precision = "fp16";
 	try {
-		PluginSession::Open(ANOFOX_GGML_CPU_PLUGIN, bf);
+		PluginSession::Open(PluginPath(), bf);
 		FAIL("expected a refusal");
 	} catch (const PluginError &e) {
 		REQUIRE(e.detail.find("fp16") != std::string::npos);
@@ -142,7 +150,7 @@ TEST_CASE("plugin_ggml: the graph may come as bytes, and a missing or misshapen 
 
 TEST_CASE("plugin_ggml: an input the graph does not declare, or a missing one, is named", "[adapter][plugin]") {
 	Fixture f;
-	auto session = PluginSession::Open(ANOFOX_GGML_CPU_PLUGIN, f.Params());
+	auto session = PluginSession::Open(PluginPath(), f.Params());
 	const std::vector<float> x(4, 1.0f);
 	const std::vector<int64_t> ids = {1};
 	const std::vector<uint8_t> mask = {1};
