@@ -18,10 +18,27 @@ if(ANOFOX_GGML_ADAPTER_TESTS)
         test/cpp/test_ggml_engine.cpp
         test/cpp/test_rank_reduce.cpp
         test/cpp/test_shape_eval.cpp
+        test/cpp/test_plugin_host.cpp
         ${ANOFOX_GGML_ADAPTER_SOURCES})
     add_dependencies(adapter_tests ggml)
     target_include_directories(adapter_tests PRIVATE test/cpp)
     target_link_libraries(adapter_tests PRIVATE anofox_ggml)
+    # The plugin loader is tested against real libraries: the fake plugin, the same source built against another ABI version, and a
+    # shared library that is no plugin at all.
+    foreach(_fake fake_plugin fake_plugin_bad_abi)
+        add_library(${_fake} MODULE test/cpp/plugin_fixture/fake_plugin.cpp)
+        target_include_directories(${_fake} PRIVATE "${ANOFOX_GGML_ADAPTER_INCLUDE_DIR}")
+        set_target_properties(${_fake} PROPERTIES CXX_VISIBILITY_PRESET hidden PREFIX "lib")
+    endforeach()
+    target_compile_definitions(fake_plugin_bad_abi PRIVATE ANOFOX_FAKE_PLUGIN_BAD_ABI)
+    add_library(not_a_plugin MODULE test/cpp/plugin_fixture/not_a_plugin.cpp)
+    set_target_properties(not_a_plugin PROPERTIES PREFIX "lib")
+    add_dependencies(adapter_tests fake_plugin fake_plugin_bad_abi not_a_plugin)
+    target_compile_definitions(adapter_tests PRIVATE
+        ANOFOX_FAKE_PLUGIN="$<TARGET_FILE:fake_plugin>"
+        ANOFOX_FAKE_PLUGIN_BAD_ABI="$<TARGET_FILE:fake_plugin_bad_abi>"
+        ANOFOX_NOT_A_PLUGIN="$<TARGET_FILE:not_a_plugin>")
+    target_link_libraries(adapter_tests PRIVATE ${CMAKE_DL_LIBS})
     # the tests read their fixtures relative to the repository root
     set_target_properties(adapter_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 endif()
