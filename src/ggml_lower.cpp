@@ -1718,7 +1718,7 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 	}
 	// "cpu" and "cpu-sched" (the device code path on the CPU backend) run on ggml's CPU backend; "gpu"/"gpu:N" keep the unfused lowering
 	const bool cpu_backend = options.device == "cpu" || options.device == "cpu-sched";
-	std::unordered_map<std::string, ggml_tensor *> f16_masks; // one float16 copy per mask, shared by the layers that add it
+	std::unordered_map<std::string, ggml_tensor *> f16_masks; // one float16 copy per (mask, query length), shared by the layers that add it
 	auto fuse_attention = [&](const ::anofox::onnxread::Node &n) -> ggml_tensor * {
 		auto made_by = [&](const std::string &t) -> const ::anofox::onnxread::Node * {
 			const auto it = producer.find(t);
@@ -1821,9 +1821,20 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 		if (kts[0] != B || kts[1] != H || kts[2] != D || vs[0] != B || vs[1] != H || vs[2] != SK) {
 			return nullptr; // broadcast batch or head dimensions: left to the unfused lowering
 		}
-		const Shape &out_shape = value(n.outputs.at(0))->shape;
-		if (out_shape != Shape {B, H, S, vs[3]}) {
+		const ShapeValue *out_value = value(n.outputs.at(0));
+		if (!out_value || out_value->shape != Shape {B, H, S, vs[3]}) {
 			return nullptr;
+		}
+		Shape ms; // the mask's shape right-aligned to four dimensions; checked before any tensor is created
+		if (!mask.empty()) {
+			ms = value(mask)->shape;
+			if (ms.size() > 4) {
+				return nullptr;
+			}
+			ms.insert(ms.begin(), 4 - ms.size(), 1);
+			if (ms[3] != SK || (ms[2] != 1 && ms[2] != S) || (ms[1] != 1 && ms[1] != H) || (ms[0] != 1 && ms[0] != B)) {
+				return nullptr;
+			}
 		}
 		ggml_context *c = ctx.get();
 		auto rows_contiguous = [&](ggml_tensor *t) { return t->nb[0] == ggml_type_size(t->type) ? t : ggml_cont(c, t); };
@@ -1832,25 +1843,20 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 		ggml_tensor *v = rows_contiguous(tensor_of(n, vn));                                          // ne [Dv, SK, H, B]
 		ggml_tensor *m16 = nullptr;
 		if (!mask.empty()) {
-			Shape ms = value(mask)->shape;
-			if (ms.size() > 4) {
-				return nullptr;
-			}
-			ms.insert(ms.begin(), 4 - ms.size(), 1);
-			if (ms[3] != SK || (ms[2] != 1 && ms[2] != S) || (ms[1] != 1 && ms[1] != H) || (ms[0] != 1 && ms[0] != B)) {
-				return nullptr;
-			}
-			auto cached = f16_masks.find(mask);
+			// The kernel reads one mask row per query row (no broadcast over queries), so a key-padding mask is repeated to S rows: the
+			// float16 copy depends on S, and attentions over the same mask with other query lengths need their own.
+			const std::string key = mask + "#" + std::to_string(S);
+			auto cached = f16_masks.find(key);
 			if (cached != f16_masks.end()) {
 				m16 = cached->second;
 			} else {
 				ggml_tensor *m = low.Contiguous(tensor_of(n, mask));
 				m = ggml_reshape_4d(c, m, SK, ms[2], ms[1], ms[0]);
-				if (ms[2] != S) { // the kernel reads one mask row per query row: no broadcast over queries
+				if (ms[2] != S) {
 					m = ggml_repeat(c, m, ggml_new_tensor_4d(c, GGML_TYPE_F32, SK, S, ms[1], ms[0]));
 				}
 				m16 = ggml_cast(c, m, GGML_TYPE_F16);
-				f16_masks[mask] = m16;
+				f16_masks[key] = m16;
 			}
 		}
 		ggml_tensor *fa = ggml_flash_attn_ext(c, q, k, v, m16, static_cast<float>(scale), 0.0f, 0.0f);

@@ -750,4 +750,40 @@ sdpa_case("sdpa_no_mask", 1, 2, 12, 4, None, casts=False)
 # a real-valued additive bias is not a 0/-max mask: it stays on the unfused path (an F16 mask would round it)
 sdpa_case("sdpa_float_bias_unfused", 1, 2, 12, 4, None, bias=rand(1, 2, 12, 12))
 
+
+# Two attentions over the same 12 keys and the same key-padding mask [b, 1, 1, 12], with 4 and then 9 query rows: the fused lowering
+# repeats the mask to the query length, so a mask prepared for the first must not be reused by the second.
+def two_lengths_case(name):
+    b, h, sk, d = 2, 2, 12, 4
+    k, v, q4, q9 = rand(b, h, sk, d), rand(b, h, sk, d), rand(b, h, 4, d), rand(b, h, 9, d)
+    keep = (np.arange(sk)[None, :] < np.array([[12], [7]]))[:, None, None, :]
+    nodes = [helper.make_node("Transpose", ["k"], ["kt"], perm=[0, 1, 3, 2]),
+             helper.make_node("Where", ["keep", "zero", "lowest"], ["mask"])]
+    for tag in ("q4", "q9"):
+        nodes += [helper.make_node("MatMul", [tag, "kt"], [tag + "_qk"]), helper.make_node("Mul", [tag + "_qk", "scale"], [tag + "_s"]),
+                  helper.make_node("Add", [tag + "_s", "mask"], [tag + "_m"]), helper.make_node("Softmax", [tag + "_m"], [tag + "_p"], axis=-1),
+                  helper.make_node("MatMul", [tag + "_p", "v"], [tag + "_o"])]
+    nodes.append(helper.make_node("Concat", ["q4_o", "q9_o"], ["y"], axis=2))
+    case(name, "MatMul", {"q4": q4, "q9": q9, "k": k, "v": v, "keep": keep}, nodes=nodes,
+         inits={"scale": np.float32(0.5), "zero": np.float32(0.0), "lowest": np.float32(np.finfo(np.float32).min)})
+
+
+two_lengths_case("sdpa_shared_mask_two_query_lengths")
+
+
+# One query row against 600 keys (one test row against many train rows): ggml's split-KV kernel (B = S = 1, at least 512 keys)
+def single_query_case(name):
+    sk, d = 600, 4
+    q, k, v = rand(1, 2, 1, d), rand(1, 2, sk, d), rand(1, 2, sk, d)
+    keep = (np.arange(sk) < 550)[None, None, None, :]
+    nodes = [helper.make_node("Transpose", ["k"], ["kt"], perm=[0, 1, 3, 2]), helper.make_node("MatMul", ["q", "kt"], ["qk"]),
+             helper.make_node("Mul", ["qk", "scale"], ["s"]), helper.make_node("Where", ["keep", "zero", "lowest"], ["mask"]),
+             helper.make_node("Add", ["s", "mask"], ["m"]), helper.make_node("Softmax", ["m"], ["p"], axis=-1),
+             helper.make_node("MatMul", ["p", "v"], ["y"])]
+    case(name, "MatMul", {"q": q, "k": k, "v": v, "keep": keep}, nodes=nodes,
+         inits={"scale": np.float32(0.5), "zero": np.float32(0.0), "lowest": np.float32(np.finfo(np.float32).min)})
+
+
+single_query_case("sdpa_single_query_split_kv")
+
 print(len(os.listdir(OUT)) // 2, "cases in", os.path.normpath(OUT))
