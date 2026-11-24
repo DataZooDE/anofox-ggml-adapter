@@ -298,6 +298,94 @@ const std::unordered_map<std::string, Handler> &Handlers() {
 		     }
 		     return Wrap(std::move(r));
 	     }},
+	    {"Flatten",
+	     [](const Node &n, const Args &in, const Ctx &c) {
+		     // [prod(dims[:axis]), prod(dims[axis:])]; axis may be negative, axis 0 gives a leading 1
+		     auto shape = in[0]->shape();
+		     const int64_t rank = static_cast<int64_t>(shape.size());
+		     int64_t axis = AttrInt(n, "axis", 1);
+		     if (axis < 0) axis += rank;
+		     if (axis < 0 || axis > rank) {
+			     throw std::runtime_error("Flatten: axis out of range for rank " + std::to_string(rank));
+		     }
+		     int64_t outer = 1, inner = 1;
+		     for (int64_t i = 0; i < rank; i++) {
+			     (i < axis ? outer : inner) *= shape[i];
+		     }
+		     std::vector<int> two = {static_cast<int>(outer), static_cast<int>(inner)};
+		     Arr r;
+		     Ok(mlx_reshape(r.out(), in[0]->get(), two.data(), two.size(), c.s), "flatten");
+		     return Wrap(std::move(r));
+	     }},
+	    {"Split",
+	     [](const Node &n, const Args &in, const Ctx &c) {
+		     // The part sizes come from the 'split' input (opset 13+) or attribute (older). Without them the axis is cut into one
+		     // part per output: equally, or with num_outputs (opset 18) ceil(dim / n) each and a smaller, possibly empty, last
+		     // part. Zero-size parts are allowed. The refusals are the ggml engine's (ggml_lower.cpp).
+		     auto shape = in[0]->shape();
+		     const int64_t rank = static_cast<int64_t>(shape.size());
+		     int64_t axis = AttrInt(n, "axis", 0);
+		     if (axis < 0) axis += rank;
+		     if (axis < 0 || axis >= rank) {
+			     throw std::runtime_error("Split: axis out of range for rank " + std::to_string(rank));
+		     }
+		     const int64_t dim = shape[axis];
+		     const int64_t parts = static_cast<int64_t>(n.outputs.size());
+		     bool have_sizes = false;
+		     std::vector<int64_t> sizes;
+		     if (in.size() > 1 && in[1]) {
+			     sizes = ToInts(*in[1], c.s);
+			     have_sizes = true;
+		     } else {
+			     sizes = AttrInts(n, "split", &have_sizes);
+		     }
+		     const bool have_num = n.Attr("num_outputs") != nullptr;
+		     if (have_sizes && have_num) {
+			     throw std::runtime_error("Split: both part sizes and num_outputs were given");
+		     }
+		     if (!have_sizes) {
+			     if (have_num) {
+				     const int64_t num = AttrInt(n, "num_outputs", 0);
+				     if (num <= 0) {
+					     throw std::runtime_error("Split: num_outputs must be positive");
+				     }
+				     const int64_t chunk = (dim + num - 1) / num;
+				     for (int64_t i = 0, left = dim; i < num; i++) {
+					     sizes.push_back(std::min(chunk, left));
+					     left -= sizes.back();
+				     }
+			     } else {
+				     if (parts <= 0 || dim % parts != 0) {
+					     throw std::runtime_error("Split: dimension " + std::to_string(dim) + " cannot be split equally into " +
+					                              std::to_string(parts) + " parts (give the part sizes or num_outputs)");
+				     }
+				     sizes.assign(parts, dim / parts);
+			     }
+		     }
+		     int64_t total = 0;
+		     for (int64_t s : sizes) {
+			     if (s < 0) {
+				     throw std::runtime_error("Split: a negative part size");
+			     }
+			     total += s;
+		     }
+		     if (total != dim || static_cast<int64_t>(sizes.size()) != parts) {
+			     throw std::runtime_error("Split: the part sizes do not add up to the axis, or do not match the outputs");
+		     }
+		     std::vector<Arr> out;
+		     int64_t start = 0;
+		     for (int64_t s : sizes) {
+			     std::vector<int> lo(rank, 0), hi(shape.begin(), shape.end()), strd(rank, 1);
+			     lo[axis] = static_cast<int>(start);
+			     hi[axis] = static_cast<int>(start + s);
+			     Arr r;
+			     Ok(mlx_slice(r.out(), in[0]->get(), lo.data(), lo.size(), hi.data(), hi.size(), strd.data(), strd.size(), c.s),
+			        "split");
+			     out.push_back(std::move(r));
+			     start += s;
+		     }
+		     return out;
+	     }},
 	    {"Expand",
 	     [](const Node &, const Args &in, const Ctx &c) {
 		     // ONNX Expand is BIDIRECTIONAL broadcast, not broadcast_to: the
@@ -991,6 +1079,10 @@ std::map<std::string, Tensor> Graph::Run(const std::vector<std::pair<std::string
 		Ok(mlx_array_eval(out32.get()), "eval output"); // MLX is lazy; nothing ran until here
 		Tensor result;
 		result.shape = out32.shape();
+		if (out32.size() == 0) { // a zero-size output (e.g. an empty Split part) is returned empty: MLX gives it no buffer
+			results[name] = std::move(result);
+			continue;
+		}
 		const float *data = mlx_array_data_float32(out32.get());
 		if (!data) {
 			mlx_stream_free(gpu);

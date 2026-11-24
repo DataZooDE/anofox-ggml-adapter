@@ -40,3 +40,20 @@ unset(CMAKE_REQUIRED_LIBRARIES)
 if(ANOFOX_MLX_C_HAS_CUMSUM_AXIS)
     target_compile_definitions(anofox_mlx_plugin PRIVATE ANOFOX_MLX_C_07=1)
 endif()
+
+# The interpreter's own tests (test/cpp/test_mlx_goldens.cpp: ops against the ONNX Runtime goldens), run from the repository root:
+#   cmake -S tools/mlx_plugin -B build/mlx -DANOFOX_MLX_TESTS=ON && cmake --build build/mlx && build/mlx/mlx_tests
+option(ANOFOX_MLX_TESTS "build mlx_tests, the MLX interpreter against the op goldens" OFF)
+if(ANOFOX_MLX_TESTS)
+    add_executable(mlx_tests
+        "${_root}/test/cpp/test_main.cpp"
+        "${_root}/test/cpp/test_mlx_goldens.cpp"
+        "${_root}/src/mlxgraph/mlx_graph.cpp"
+        "${_root}/src/onnx_reader.cpp")
+    target_include_directories(mlx_tests PRIVATE "${_root}/src" "${_root}/include" "${_root}/test/cpp" "${ANOFOX_MLX_DIR}/include")
+    target_link_libraries(mlx_tests PRIVATE "${ANOFOX_MLX_C_LIB}" "${ANOFOX_MLX_LIB}")
+    target_compile_features(mlx_tests PRIVATE cxx_std_17)
+    if(ANOFOX_MLX_C_HAS_CUMSUM_AXIS)
+        target_compile_definitions(mlx_tests PRIVATE ANOFOX_MLX_C_07=1)
+    endif()
+endif()

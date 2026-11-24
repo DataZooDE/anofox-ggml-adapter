@@ -127,9 +127,11 @@ jobs:
         run: brew install mlx mlx-c ninja
       - name: Build the plugin
         run: |
-          cmake -S tools/mlx_plugin -B build/mlx -G Ninja -DCMAKE_BUILD_TYPE=Release -DANOFOX_MLX_DIR="$(brew --prefix)"
+          cmake -S tools/mlx_plugin -B build/mlx -G Ninja -DCMAKE_BUILD_TYPE=Release -DANOFOX_MLX_DIR="$(brew --prefix)" -DANOFOX_MLX_TESTS=ON
           cmake --build build/mlx
           cp build/mlx/libanofox_mlx_plugin.dylib .
+      - name: The MLX interpreter against the op goldens
+        run: build/mlx/mlx_tests
       - name: Sanity - one exported symbol, and only the expected dependencies
         run: |
           nm -gU libanofox_mlx_plugin.dylib | grep -q "_AnofoxGgmlGetPluginApi" || { echo "ABI symbol missing"; exit 1; }
