@@ -99,12 +99,12 @@ typedef struct {
 	size_t count;
 } AnofoxGgmlRunOutput;
 
-/* A fingerprint of every struct that crosses the boundary. The version says which ABI a plugin speaks; this catches a plugin built
+/* A fingerprint of every struct that crosses the boundary, the function table included (a function added at the same version). The version says which ABI a plugin speaks; this catches a plugin built
  * from another revision of this header at the same version (a field added before a release), whose structs the host would read at
  * the wrong size. Checked right after abi_version. */
 #define ANOFOX_GGML_PLUGIN_LAYOUT                                                                                                  \
 	((uint32_t)((sizeof(AnofoxGgmlCreateParams) << 20) ^ (sizeof(AnofoxGgmlWeight) << 13) ^ (sizeof(AnofoxGgmlTensorIn) << 6) ^    \
-	            sizeof(AnofoxGgmlTensorOut) ^ (sizeof(AnofoxGgmlRunOutput) << 26)))
+	            sizeof(AnofoxGgmlTensorOut) ^ (sizeof(AnofoxGgmlRunOutput) << 26) ^ (sizeof(AnofoxGgmlPluginApi) << 16)))
 
 typedef struct {
 	int abi_version; /* the ONLY field a host reads before checking it */

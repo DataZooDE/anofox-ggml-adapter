@@ -1,5 +1,7 @@
 #include "anofox_ggml_adapter/plugin_host.hpp"
 
+#include <filesystem>
+
 #include <cstring>
 
 // Is this translation unit built with AddressSanitizer? Used only to drop RTLD_DEEPBIND, which the sanitizer runtime cannot tolerate
@@ -74,7 +76,12 @@ std::string LibraryError() {
 #else
 using LibraryHandle = HMODULE;
 LibraryHandle OpenLibrary(const std::string &path) {
-	return LoadLibraryA(path.c_str());
+	// The plugin's own dependencies are looked up next to it, then in the system directories: not in the current directory or
+	// along PATH, where another DLL of the same name could be planted. The flags need an absolute path (a setting may be relative).
+	std::error_code ec;
+	const auto absolute = std::filesystem::absolute(path, ec);
+	return LoadLibraryExA(ec ? path.c_str() : absolute.string().c_str(), nullptr,
+	                      LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
 }
 void *LibrarySymbol(LibraryHandle lib, const char *symbol) {
 	return reinterpret_cast<void *>(GetProcAddress(lib, symbol));

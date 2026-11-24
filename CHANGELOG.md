@@ -11,6 +11,8 @@
 - `Flatten` and `Split` (the `split` input, the attribute and opset 18's `num_outputs`, zero-size parts); data inputs typed by the
   graph (int64 token ids, bool masks); `GgmlExecutor::InitializerCopyBytes()`.
 
+- `CgroupCpuLimitFrom()`; `PhysicalCpuCores()` is capped by a container's cgroup CPU quota and counts cores by the kernel's
+  `core_cpus_list` (device-tree arm64 restarts `core_id` per cluster, which the (package, core) count halved).
 - `PhysicalCpuCores()` (devices.hpp): the physical cores this process may use, SMT siblings counted once (sysfs topology within the
   process's affinity on Linux, `hw.physicalcpu` on macOS, the processor-core records on Windows). The CPU engine is fastest at one
   thread per physical core; hosts cap their engine threads with it.
@@ -18,6 +20,11 @@
   Runtime goldens by the new `mlx_tests` (tools/mlx_plugin `-DANOFOX_MLX_TESTS=ON`; run in the MLX plugin CI job).
 
 ### Changed
+- The plugin layout fingerprint covers the plugin's function table too (a function added at the same ABI version is caught).
+- CUDA discovery loads and initialises NVML once per process and keeps the devices it saw when a later probe fails: a GPU
+  no longer vanishes mid-session (an RTX 4090 run lost its device between two models).
+- The MLX interpreter refuses a `Split` whose `num_outputs` leaves a last part below zero, as ONNX and the ggml engine do.
+- Windows loads a plugin with `LoadLibraryEx` restricted to the plugin's own directory and the system directories.
 - The MLX interpreter returns a zero-size graph output empty instead of failing on its missing buffer.
 - Float32 initializers inside the ONNX file are read in place instead of copied per compiled shape: the parsed graph must outlive
   the executor.

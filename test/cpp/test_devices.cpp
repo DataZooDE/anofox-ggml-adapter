@@ -39,8 +39,10 @@ std::string FakeKfdTopology(const std::string &tag, const std::vector<std::pair<
 	return root.string();
 }
 
-//! A fake /sys/devices/system/cpu: cpuN/topology/{physical_package_id,core_id} for each (package, core) pair, cpu index = position.
-std::string FakeCpuTopology(const std::string &tag, const std::vector<std::pair<int, int>> &cpus) {
+//! A fake /sys/devices/system/cpu: cpuN/topology/{physical_package_id,core_id} for each (package, core) pair, cpu index = position,
+//! and core_cpus_list (the cpus sharing that core) when `with_lists`, as current kernels write it.
+std::string FakeCpuTopology(const std::string &tag, const std::vector<std::pair<int, int>> &cpus, bool with_lists = false,
+                            const std::vector<std::string> &lists = {}) {
 	namespace fs = std::filesystem;
 	const fs::path root = fs::temp_directory_path() / ("anofox_ggml_fake_cpu_" + tag);
 	fs::remove_all(root);
@@ -49,6 +51,9 @@ std::string FakeCpuTopology(const std::string &tag, const std::vector<std::pair<
 		fs::create_directories(dir);
 		std::ofstream(dir / "physical_package_id") << cpus[i].first << "\n";
 		std::ofstream(dir / "core_id") << cpus[i].second << "\n";
+		if (with_lists) {
+			std::ofstream(dir / "core_cpus_list") << lists[i] << "\n";
+		}
 	}
 	fs::create_directories(root / "cpufreq"); // not a cpuN directory: ignored
 	return root.string();
@@ -67,9 +72,36 @@ TEST_CASE("devices: physical cores count SMT siblings once, per package, within 
 	REQUIRE(PhysicalCpuCoresFrom(sockets, {}) == 4);
 	// no topology at all: 0, so the caller falls back
 	REQUIRE(PhysicalCpuCoresFrom((std::filesystem::temp_directory_path() / "anofox_ggml_no_such_cpu_dir").string(), {}) == 0);
+	// device-tree arm64 (RK3588: clusters of 4+2+2 cores): core_id restarts per cluster, so (package, core) undercounts; the
+	// kernel's core_cpus_list tells the cores apart
+	const auto clusters = FakeCpuTopology("clusters", {{0, 0}, {0, 1}, {0, 2}, {0, 3}, {0, 0}, {0, 1}, {0, 0}, {0, 1}}, true,
+	                                      {"0", "1", "2", "3", "4", "5", "6", "7"});
+	REQUIRE(PhysicalCpuCoresFrom(clusters, {}) == 8);
+	// SMT with core_cpus_list: siblings share one list
+	const auto smt_lists = FakeCpuTopology("smt_lists", {{0, 0}, {0, 1}, {0, 0}, {0, 1}}, true, {"0,2", "1,3", "0,2", "1,3"});
+	REQUIRE(PhysicalCpuCoresFrom(smt_lists, {}) == 2);
 	// on this machine: at least one core, never more than the hardware threads
 	REQUIRE(PhysicalCpuCores() >= 1);
 	REQUIRE(PhysicalCpuCores() <= static_cast<int>(std::max(1u, std::thread::hardware_concurrency())));
+}
+
+TEST_CASE("devices: a cgroup CPU quota caps the cores a container may use", "[adapter][devices]") {
+	namespace fs = std::filesystem;
+	const fs::path root = fs::temp_directory_path() / "anofox_ggml_fake_cgroup";
+	fs::remove_all(root);
+	fs::create_directories(root);
+	REQUIRE(CgroupCpuLimitFrom(root.string()) == 0); // no controller files: no limit
+	std::ofstream(root / "cpu.max") << "max 100000\n";
+	REQUIRE(CgroupCpuLimitFrom(root.string()) == 0); // v2, unlimited
+	std::ofstream(root / "cpu.max") << "250000 100000\n";
+	REQUIRE(CgroupCpuLimitFrom(root.string()) == 3); // v2: 2.5 CPUs round up
+	fs::remove(root / "cpu.max");
+	fs::create_directories(root / "cpu");
+	std::ofstream(root / "cpu" / "cpu.cfs_quota_us") << "200000\n";
+	std::ofstream(root / "cpu" / "cpu.cfs_period_us") << "100000\n";
+	REQUIRE(CgroupCpuLimitFrom(root.string()) == 2); // v1
+	std::ofstream(root / "cpu" / "cpu.cfs_quota_us") << "-1\n";
+	REQUIRE(CgroupCpuLimitFrom(root.string()) == 0); // v1, unlimited
 }
 
 TEST_CASE("devices: every compute-capable KFD node is a rocm device, usable when the plugin carries its architecture", "[adapter][devices]") {

@@ -39,8 +39,15 @@ bool CudaComputeCapabilityUsable(int major, int minor);
 int PhysicalCpuCores();
 
 //! PhysicalCpuCores() over a sysfs cpu directory (a test seam: /sys/devices/system/cpu on a real machine), counting the distinct
-//! (package, core) pairs among the cpus `allowed` says this process may use (empty: all). 0 when the directory has no topology.
+//! cores among the cpus `allowed` says this process may use (empty: all): by topology/core_cpus_list (thread_siblings_list on
+//! older kernels), else by (physical_package_id, core_id), which undercounts device-tree arm64 where core_id restarts per
+//! cluster. 0 when the directory has no topology.
 int PhysicalCpuCoresFrom(const std::string &cpu_dir, const std::vector<int> &allowed);
+
+//! The CPUs a cgroup CPU quota allows, rounded up (a test seam over a cgroup root: cpu.max for v2, cpu/cpu.cfs_quota_us and
+//! cpu/cpu.cfs_period_us for v1); 0 when there is no quota. PhysicalCpuCores() is capped by it on Linux: a container limited
+//! to 2 CPUs on a 64-core host must not run 64 threads that hit barriers while throttled.
+int CgroupCpuLimitFrom(const std::string &cgroup_root);
 
 //! The gfx architectures the released ROCm plugin carries code objects for.
 const std::vector<std::string> &GgmlRocmPluginArchs();

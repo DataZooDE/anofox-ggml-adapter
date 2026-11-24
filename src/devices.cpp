@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <set>
 #include <thread>
 #include <utility>
@@ -92,9 +93,6 @@ NvmlHandle NvmlOpen(const char *name) {
 void *NvmlSymbol(NvmlHandle lib, const char *symbol) {
 	return reinterpret_cast<void *>(GetProcAddress(lib, symbol));
 }
-void NvmlClose(NvmlHandle lib) {
-	FreeLibrary(lib);
-}
 #else
 using NvmlHandle = void *;
 const char *const kNvmlLibraries[] = {"libnvidia-ml.so.1", "libnvidia-ml.so"};
@@ -104,19 +102,38 @@ NvmlHandle NvmlOpen(const char *name) {
 void *NvmlSymbol(NvmlHandle lib, const char *symbol) {
 	return dlsym(lib, symbol);
 }
-void NvmlClose(NvmlHandle lib) {
-	dlclose(lib);
-}
 #endif
 
+//! One NVML probe. Hosts discover on every query, so NVML is loaded and initialised once per process and never shut down (NVML
+//! refcounts its init; opening and closing the library per query, next to a live CUDA context, is what a driver least expects),
+//! and a probe that fails after one succeeded keeps the devices already seen: a GPU must not vanish mid-session because one
+//! nvmlInit or nvmlDeviceGetCount failed under load (an explicit 'cuda' would then refuse a query the GPU had been serving).
+void ProbeCudaDevicesOnce(std::vector<DeviceInfo> &devices);
+
 void ProbeCudaDevices(std::vector<DeviceInfo> &devices) {
-	NvmlHandle nvml = nullptr;
-	for (auto *candidate : kNvmlLibraries) {
-		nvml = NvmlOpen(candidate);
-		if (nvml) {
-			break;
-		}
+	static std::mutex lock;
+	static std::vector<DeviceInfo> last_good;
+	std::lock_guard<std::mutex> guard(lock);
+	std::vector<DeviceInfo> found;
+	ProbeCudaDevicesOnce(found);
+	if (!found.empty()) {
+		last_good = found;
 	}
+	const auto &use = found.empty() ? last_good : found;
+	devices.insert(devices.end(), use.begin(), use.end());
+}
+
+void ProbeCudaDevicesOnce(std::vector<DeviceInfo> &devices) {
+	static NvmlHandle nvml = [] {
+		NvmlHandle handle = nullptr;
+		for (auto *candidate : kNvmlLibraries) {
+			handle = NvmlOpen(candidate);
+			if (handle) {
+				break;
+			}
+		}
+		return handle;
+	}();
 	if (!nvml) {
 		return;
 	}
@@ -128,16 +145,21 @@ void ProbeCudaDevices(std::vector<DeviceInfo> &devices) {
 	using CcFn = int (*)(void *, int *, int *);
 	using DriverFn = int (*)(char *, unsigned int);
 	auto nvml_init = reinterpret_cast<InitFn>(NvmlSymbol(nvml, "nvmlInit_v2"));
-	auto nvml_shutdown = reinterpret_cast<InitFn>(NvmlSymbol(nvml, "nvmlShutdown"));
 	auto nvml_count = reinterpret_cast<CountFn>(NvmlSymbol(nvml, "nvmlDeviceGetCount_v2"));
 	auto nvml_handle = reinterpret_cast<HandleFn>(NvmlSymbol(nvml, "nvmlDeviceGetHandleByIndex_v2"));
 	auto nvml_name = reinterpret_cast<NameFn>(NvmlSymbol(nvml, "nvmlDeviceGetName"));
 	auto nvml_memory = reinterpret_cast<MemFn>(NvmlSymbol(nvml, "nvmlDeviceGetMemoryInfo"));
 	auto nvml_cc = reinterpret_cast<CcFn>(NvmlSymbol(nvml, "nvmlDeviceGetCudaComputeCapability"));
 	auto nvml_driver = reinterpret_cast<DriverFn>(NvmlSymbol(nvml, "nvmlSystemGetDriverVersion"));
-	if (!nvml_init || !nvml_count || !nvml_handle || nvml_init() != 0) {
-		NvmlClose(nvml);
+	static bool initialised = false; // under ProbeCudaDevices' lock
+	if (!nvml_init || !nvml_count || !nvml_handle) {
 		return;
+	}
+	if (!initialised) {
+		if (nvml_init() != 0) {
+			return; // retried on the next probe
+		}
+		initialised = true;
 	}
 	char driver_version[96] = {0};
 	if (nvml_driver) {
@@ -172,10 +194,7 @@ void ProbeCudaDevices(std::vector<DeviceInfo> &devices) {
 			devices.push_back(std::move(d));
 		}
 	}
-	if (nvml_shutdown) {
-		nvml_shutdown();
-	}
-	NvmlClose(nvml);
+	// NVML stays loaded and initialised for the process: see ProbeCudaDevices
 }
 
 //===----------------------------------------------------------------------===//
@@ -272,6 +291,7 @@ int PhysicalCpuCoresFrom(const std::string &cpu_dir, const std::vector<int> &all
 	namespace fs = std::filesystem;
 	const std::set<int> allow(allowed.begin(), allowed.end());
 	std::set<std::pair<long, long>> cores; // (package, core): core ids repeat across packages
+	std::set<std::string> core_lists;        // the cpus of each core, where the kernel writes them
 	std::error_code ec;
 	for (fs::directory_iterator it(cpu_dir, ec), end; !ec && it != end; it.increment(ec)) {
 		const std::string name = it->path().filename().string();
@@ -283,6 +303,14 @@ int PhysicalCpuCoresFrom(const std::string &cpu_dir, const std::vector<int> &all
 		if (!allow.empty() && !allow.count(index)) {
 			continue;
 		}
+		std::string list;
+		std::ifstream(it->path() / "topology" / "core_cpus_list") >> list;
+		if (list.empty()) {
+			std::ifstream(it->path() / "topology" / "thread_siblings_list") >> list;
+		}
+		if (!list.empty()) {
+			core_lists.insert(list);
+		}
 		long package = -1, core = -1;
 		std::ifstream(it->path() / "topology" / "physical_package_id") >> package;
 		std::ifstream(it->path() / "topology" / "core_id") >> core;
@@ -290,7 +318,25 @@ int PhysicalCpuCoresFrom(const std::string &cpu_dir, const std::vector<int> &all
 			cores.insert({package, core});
 		}
 	}
-	return static_cast<int>(cores.size());
+	// the sibling lists name each core exactly (core_id restarts per cluster on device-tree arm64); (package, core) otherwise
+	return static_cast<int>(!core_lists.empty() ? core_lists.size() : cores.size());
+}
+
+int CgroupCpuLimitFrom(const std::string &cgroup_root) {
+	auto ceil_div = [](long long quota, long long period) {
+		return period > 0 && quota > 0 ? static_cast<int>((quota + period - 1) / period) : 0;
+	};
+	std::ifstream v2(cgroup_root + "/cpu.max"); // "<quota> <period>" or "max <period>"
+	if (v2) {
+		std::string quota;
+		long long period = 0;
+		v2 >> quota >> period;
+		return quota == "max" || quota.empty() ? 0 : ceil_div(std::atoll(quota.c_str()), period);
+	}
+	long long quota = -1, period = 0;
+	std::ifstream(cgroup_root + "/cpu/cpu.cfs_quota_us") >> quota;
+	std::ifstream(cgroup_root + "/cpu/cpu.cfs_period_us") >> period;
+	return ceil_div(quota, period);
 }
 
 int PhysicalCpuCores() {
@@ -307,6 +353,10 @@ int PhysicalCpuCores() {
 			}
 		}
 		n = PhysicalCpuCoresFrom("/sys/devices/system/cpu", allowed);
+		const int quota = CgroupCpuLimitFrom("/sys/fs/cgroup"); // a container's CPU limit (its own cgroup is mounted at the root)
+		if (quota > 0 && (n <= 0 || quota < n)) {
+			n = quota;
+		}
 #elif defined(__APPLE__)
 		int value = 0;
 		size_t size = sizeof(value);

@@ -137,3 +137,12 @@ TEST_CASE("mlx goldens: Flatten and Split match ONNX Runtime bit for bit", "[ada
 	REQUIRE(ran["Flatten"] >= 6);
 	REQUIRE(ran["Split"] >= 10);
 }
+
+TEST_CASE("mlx goldens: Split with num_outputs refuses a last part below zero, as ONNX and the ggml engine do", "[adapter][mlx]") {
+	// x [5], num_outputs 4: ceil(5/4) = 2 per part leaves -1 for the last (tools/ggml_parity/make_mlx_fixtures.py)
+	Graph graph("test/fixtures/mlx/split_num_outputs_negative_last.onnx", nullptr, 0, {});
+	Tensor x;
+	x.shape = {5};
+	x.data = {1, 2, 3, 4, 5};
+	REQUIRE_THROWS_WITH(graph.Run({{"x", x}}, {}), Catch::Contains("Split"));
+}

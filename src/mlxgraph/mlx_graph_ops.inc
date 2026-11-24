@@ -349,11 +349,17 @@ const std::unordered_map<std::string, Handler> &Handlers() {
 				     if (num <= 0) {
 					     throw std::runtime_error("Split: num_outputs must be positive");
 				     }
+				     // ceil(dim / n) per part, the last one shorter; a last part below zero is refused (dim 5 into 4), never
+				     // filled with empties, as in the ONNX reference and the ggml engine (shape_eval.cpp)
 				     const int64_t chunk = (dim + num - 1) / num;
-				     for (int64_t i = 0, left = dim; i < num; i++) {
-					     sizes.push_back(std::min(chunk, left));
-					     left -= sizes.back();
+				     const int64_t last = dim - chunk * (num - 1);
+				     if (last < 0) {
+					     throw std::runtime_error("Split: dimension " + std::to_string(dim) + " cannot be cut into " +
+					                              std::to_string(num) + " parts of " + std::to_string(chunk) +
+					                              " (the last part would be " + std::to_string(last) + ")");
 				     }
+				     sizes.assign(num - 1, chunk);
+				     sizes.push_back(last);
 			     } else {
 				     if (parts <= 0 || dim % parts != 0) {
 					     throw std::runtime_error("Split: dimension " + std::to_string(dim) + " cannot be split equally into " +
@@ -773,7 +779,8 @@ Graph::Graph(const std::string &graph_path, const void *graph_data, size_t graph
 	impl_->parsed = graph_data ? ::anofox::onnxread::ParseModelBytes(static_cast<const uint8_t *>(graph_data), graph_size, "graph")
 	                           : ::anofox::onnxread::ParseModelFile(graph_path);
 
-	// External initializers come from the host's buffers, by name (the host maps its checkpoint; nobody copies a 6.6 GB model).
+	// External initializers come from the host's buffers, by name (the host maps its checkpoint). mlx_array_new_data copies each one
+	// into MLX memory, so a unified-memory Mac holds the weights twice while the host keeps its mapping (a known cost, not yet removed).
 	for (const auto &t : impl_->parsed.initializers) {
 		std::vector<int> shape(t.dims.begin(), t.dims.end()); // rank preserved, incl. 0
 		const void *bytes = nullptr;
