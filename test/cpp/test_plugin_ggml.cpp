@@ -20,10 +20,17 @@ using namespace anofox::ggml_adapter;
 
 namespace {
 
-//! The plugin under test: the CPU build, or the GPU build named by ANOFOX_GGML_TEST_PLUGIN.
+//! The plugin under test: the CPU build, or the GPU build named by ANOFOX_GGML_TEST_PLUGIN (a ggml GPU build or the MLX plugin; the
+//! same contract holds for every backend).
 const char *PluginPath() {
 	const char *env = std::getenv("ANOFOX_GGML_TEST_PLUGIN");
 	return env && *env ? env : ANOFOX_GGML_CPU_PLUGIN;
+}
+
+//! The backend name the plugin under test reports: "ggml", or ANOFOX_GGML_TEST_PLUGIN_NAME (e.g. "mlx").
+std::string ExpectedName() {
+	const char *env = std::getenv("ANOFOX_GGML_TEST_PLUGIN_NAME");
+	return env && *env ? env : "ggml";
 }
 
 uint16_t FloatToHalf(float f) { // exact for the small integers and halves used here
@@ -88,7 +95,7 @@ std::vector<PluginTensor> Inputs(const std::vector<float> &x, const std::vector<
 TEST_CASE("plugin_ggml: the generic plugin runs a graph whose weights the host supplies by name", "[adapter][plugin]") {
 	Fixture f;
 	auto session = PluginSession::Open(PluginPath(), f.Params());
-	REQUIRE(session->Name() == "ggml");
+	REQUIRE(session->Name() == ExpectedName());
 	REQUIRE(session->GraphInputs() == std::vector<std::string> {"x", "ids", "mask", "k"});
 
 	const std::vector<float> x = {1, 0, 2, -1, 0.5f, 0.5f, 0, 3, -2, 1, 1, 1};
@@ -138,6 +145,18 @@ TEST_CASE("plugin_ggml: the graph may come as bytes, and a missing or misshapen 
 		REQUIRE(e.kind == PluginError::Kind::CREATE_FAILED);
 		REQUIRE(e.detail.find("'W'") != std::string::npos);
 	}
+	auto reshaped = f.Params();
+	reshaped.weights[0].shape = {3, 4}; // 12 values, but not the [4, 3] the graph declares
+	try {
+		PluginSession::Open(PluginPath(), reshaped);
+		FAIL("expected a refusal");
+	} catch (const PluginError &e) {
+		REQUIRE(e.detail.find("another shape") != std::string::npos);
+	}
+	auto shaped = f.Params();
+	shaped.weights[0].shape = {4, 3};
+	shaped.weights[1].shape = {10, 3};
+	REQUIRE(PluginSession::Open(PluginPath(), shaped)->Name() == ExpectedName());
 	auto bf = f.Params();
 	bf.precision = "fp16";
 	try {

@@ -43,6 +43,7 @@ struct PluginWeight {
 	int32_t dtype = ANOFOX_GGML_DTYPE_FLOAT; //!< FLOAT, FLOAT16 or BFLOAT16
 	const void *data = nullptr;              //!< the host's memory: it must outlive the session
 	int64_t count = 0;
+	std::vector<int64_t> shape;              //!< optional (empty = unknown); checked against the graph when given
 };
 
 struct PluginCreate {

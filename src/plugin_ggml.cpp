@@ -167,6 +167,9 @@ void *PluginCreate(const AnofoxGgmlCreateParams *params, char *err, size_t err_l
 				throw std::runtime_error("the weight '" + t.name + "' has " + std::to_string(w.count) + " values, the graph's shape needs " +
 				                         std::to_string(count));
 			}
+			if (w.rank >= 0 && (static_cast<size_t>(w.rank) != t.dims.size() || !std::equal(t.dims.begin(), t.dims.end(), w.shape))) {
+				throw std::runtime_error("the weight '" + t.name + "' was supplied with another shape than the graph declares");
+			}
 			if (w.dtype != t.data_type) {
 				throw std::runtime_error("the weight '" + t.name + "' was supplied as ONNX type " + std::to_string(w.dtype) +
 				                         ", the graph declares type " + std::to_string(t.data_type));

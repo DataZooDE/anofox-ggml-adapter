@@ -2,7 +2,8 @@
 # The GPU backend plugins (plugin ABI v3), shared by every host extension: built here, published here, downloaded by the hosts from the
 # release ANOFOX_GGML_PLUGIN_RELEASE_TAG names (include/anofox_ggml_adapter/plugin_artifacts.hpp), each with a sha256 sidecar.
 #
-# CUDA and ROCm are the ggml plugin (src/plugin_ggml.cpp, tools/ggml_plugin) built per vendor. None needs a GPU to BUILD; every push
+# CUDA and ROCm are the ggml plugin (src/plugin_ggml.cpp, tools/ggml_plugin) built per vendor; Apple GPUs use the MLX plugin
+# (src/plugin_mlx.cpp, tools/mlx_plugin). None needs a GPU to BUILD; every push
 # checks that the artifact resolves, exports the entry symbol, needs no shared CUDA runtime, and refuses cleanly without a GPU
 # (tools/gpu_test/plugin_load_check.c). Running on real GPUs is the hosts' E2E (and ANOFOX_GGML_TEST_PLUGIN for this repo's plugin tests).
 #
@@ -116,10 +117,42 @@ jobs:
             ggml-rocm_plugin.sha256
           if-no-files-found: error
 
+  mlx-plugin:
+    name: MLX plugin (Apple Silicon; links libmlx/libmlxc)
+    timeout-minutes: 20
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MLX
+        run: brew install mlx mlx-c ninja
+      - name: Build the plugin
+        run: |
+          cmake -S tools/mlx_plugin -B build/mlx -G Ninja -DCMAKE_BUILD_TYPE=Release -DANOFOX_MLX_DIR="$(brew --prefix)"
+          cmake --build build/mlx
+          cp build/mlx/libanofox_mlx_plugin.dylib .
+      - name: Sanity - one exported symbol, and only the expected dependencies
+        run: |
+          nm -gU libanofox_mlx_plugin.dylib | grep -q "_AnofoxGgmlGetPluginApi" || { echo "ABI symbol missing"; exit 1; }
+          test "$(nm -gU libanofox_mlx_plugin.dylib | wc -l)" -eq 1 || { echo "unexpected extra exports:"; nm -gU libanofox_mlx_plugin.dylib; exit 1; }
+          otool -L libanofox_mlx_plugin.dylib
+          ! otool -L libanofox_mlx_plugin.dylib | grep -qE "libonnx|libprotobuf" || { echo "the plugin linked onnx/protobuf"; exit 1; }
+          shasum -a 256 libanofox_mlx_plugin.dylib | tee mlx_plugin.sha256
+      - name: Load check - dlopen answers and create fails gracefully
+        run: |
+          cc -O2 -o plugin_load_check tools/gpu_test/plugin_load_check.c
+          ./plugin_load_check ./libanofox_mlx_plugin.dylib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: anofox-mlx-plugin
+          path: |
+            libanofox_mlx_plugin.dylib
+            mlx_plugin.sha256
+          if-no-files-found: error
+
   publish:
     name: Attach the plugins to the release (tags only)
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [ggml-cuda-plugin, ggml-rocm-plugin]
+    needs: [ggml-cuda-plugin, ggml-rocm-plugin, mlx-plugin]
     timeout-minutes: 25
     runs-on: ubuntu-22.04
     steps:
@@ -144,6 +177,6 @@ jobs:
           # gh release upload does not create the release object
           gh release create "${GITHUB_REF_NAME}" --verify-tag --generate-notes --repo "${GITHUB_REPOSITORY}" 2>/dev/null || true
           gh release upload "${GITHUB_REF_NAME}" \
-            libanofox_ggml-cuda_plugin.so libanofox_ggml-rocm_plugin.so \
-            ggml-cuda_plugin.sha256 ggml-rocm_plugin.sha256 \
+            libanofox_ggml-cuda_plugin.so libanofox_ggml-rocm_plugin.so libanofox_mlx_plugin.dylib \
+            ggml-cuda_plugin.sha256 ggml-rocm_plugin.sha256 mlx_plugin.sha256 \
             --repo "${GITHUB_REPOSITORY}" --clobber

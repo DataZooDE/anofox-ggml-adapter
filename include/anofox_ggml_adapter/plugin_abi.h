@@ -58,6 +58,8 @@ typedef struct {
 	int32_t dtype;      /* FLOAT, FLOAT16 or BFLOAT16 */
 	const void *data;   /* host memory, owned by the host, alive until destroy */
 	int64_t count;      /* number of elements */
+	int32_t rank;       /* -1 when the host does not know it; otherwise the shape below (a plugin without a graph needs it) */
+	const int64_t *shape;
 } AnofoxGgmlWeight;
 
 typedef struct {

@@ -164,7 +164,8 @@ std::unique_ptr<PluginSession> PluginSession::Open(const std::string &path, cons
 	std::vector<AnofoxGgmlWeight> weights;
 	weights.reserve(params.weights.size());
 	for (const auto &w : params.weights) {
-		weights.push_back({w.name.c_str(), w.dtype, w.data, w.count});
+		weights.push_back({w.name.c_str(), w.dtype, w.data, w.count, w.shape.empty() ? -1 : static_cast<int32_t>(w.shape.size()),
+		                   w.shape.empty() ? nullptr : w.shape.data()});
 	}
 	AnofoxGgmlCreateParams c {};
 	c.graph_path = params.graph_path.c_str();
