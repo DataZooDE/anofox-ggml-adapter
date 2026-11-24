@@ -20,6 +20,11 @@
   Runtime goldens by the new `mlx_tests` (tools/mlx_plugin `-DANOFOX_MLX_TESTS=ON`; run in the MLX plugin CI job).
 
 ### Changed
+- Attention is fused on the CPU: the exported scaled-dot-product pattern (`MatMul(q, kT)`, an optional scalar scale, an optional
+  `Where(keep, 0, -max)` mask, `Softmax` over the last axis, float casts, `MatMul(., v)`) lowers to one `ggml_flash_attn_ext`
+  instead of materialising the `[B, H, S, S]` scores. A real-valued additive bias, broadcast batch/head dimensions and the device
+  path (the GPU plugins) keep the unfused lowering. A query row with every key masked (padding) now gives 0 instead of ORT's
+  uniform average. `GgmlExecutor::GraphOpCounts()` reports the ops of a compiled graph (a test hook).
 - The plugin layout fingerprint covers the plugin's function table too (a function added at the same ABI version is caught).
 - CUDA discovery loads and initialises NVML once per process and keeps the devices it saw when a later probe fails: a GPU
   no longer vanishes mid-session (an RTX 4090 run lost its device between two models).
