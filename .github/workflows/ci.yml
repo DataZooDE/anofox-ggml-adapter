@@ -34,6 +34,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: No ONNX Runtime in the engine
         run: scripts/check_no_ort.sh
+      - name: The ROCm plugin is built for exactly the architectures devices.cpp calls usable
+        run: python3 scripts/check_rocm_archs.py
   goldens:
     name: The per-op goldens are what ONNX Runtime produces today
     runs-on: ubuntu-24.04
