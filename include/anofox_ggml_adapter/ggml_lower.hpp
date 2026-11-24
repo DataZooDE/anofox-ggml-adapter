@@ -109,6 +109,9 @@ public:
 	//! A test and diagnostics hook: compiles (or reuses) the graph for these inputs WITHOUT running it and returns, for every matrix multiplication in it, the
 	//! number of activation rows the backend will see (src1->ne[1]).
 	std::vector<int64_t> MulMatActivationRows(const HostTensors &inputs, const GgmlRunOptions &options);
+	//! A test and diagnostics hook: compiles (or reuses) the graph for these inputs WITHOUT running it and counts the ggml ops it computes, by ggml's op
+	//! name ("MUL_MAT", "SOFT_MAX", "FLASH_ATTN_EXT", ...). Views and reshapes count too.
+	std::map<std::string, int> GraphOpCounts(const HostTensors &inputs, const GgmlRunOptions &options);
 
 	//! Number of graphs compiled so far (a test hook: a repeated signature must not recompile).
 	size_t CompileCount() const;
