@@ -1707,7 +1707,7 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 	// and the unfused lowering materialises the [B, H, S, S] scores and passes over them four times. At the final MatMul the pattern is
 	// traced back from the names; when it matches, one ggml_flash_attn_ext replaces it and the unfused chain (already lowered) is dead, so
 	// it is never computed. Only a mask whose values are 0 or below the float16 range is fused (ggml's mask is float16: a real-valued
-	// bias would be rounded). A device keeps the unfused lowering its plugins were verified with.
+	// bias would be rounded). A GPU device keeps the unfused lowering its plugins were verified with.
 	std::unordered_map<std::string, const ::anofox::onnxread::Node *> producer;
 	for (const auto &nd : graph.nodes) {
 		for (const auto &o : nd.outputs) {
@@ -1716,6 +1716,8 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 			}
 		}
 	}
+	// "cpu" and "cpu-sched" (the device code path on the CPU backend) run on ggml's CPU backend; "gpu"/"gpu:N" keep the unfused lowering
+	const bool cpu_backend = options.device == "cpu" || options.device == "cpu-sched";
 	std::unordered_map<std::string, ggml_tensor *> f16_masks; // one float16 copy per mask, shared by the layers that add it
 	auto fuse_attention = [&](const ::anofox::onnxread::Node &n) -> ggml_tensor * {
 		auto made_by = [&](const std::string &t) -> const ::anofox::onnxread::Node * {
@@ -2067,7 +2069,7 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 				}
 			}
 			out = sh(0).size() > 4 ? low.TransposeBig(n, in(0), sh(0), perm, out_shape) : low.Permute(in(0), perm);
-		} else if (op == "MatMul" && !compiled->device_mode && (out = fuse_attention(n)) != nullptr) {
+		} else if (op == "MatMul" && cpu_backend && (out = fuse_attention(n)) != nullptr) {
 			// the fused attention (above)
 		} else if (op == "MatMul") {
 			const Shape &sa = sh(0), &sb = sh(1);
@@ -2963,6 +2965,7 @@ Compiled *GgmlExecutor::Impl::Acquire(const HostTensors &inputs, const GgmlRunOp
 	GgmlRunOptions compile_options = options;
 	compile_options.weights = impl.config.weights;
 	compile_options.strict_fp32 = impl.config.strict_fp32;
+	compile_options.device = impl.config.device; // the lowering fuses attention only where the CPU backend runs the graph
 	WeightProvider provider;
 	if (!impl.runtime.sched_backends.empty()) {
 		provider = [&impl](const std::string &name, const Ne4 &ne, const float *host, int onnx_type) { return impl.DeviceWeight(name, ne, host, onnx_type); };

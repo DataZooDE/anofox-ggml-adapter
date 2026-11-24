@@ -921,8 +921,8 @@ TEST_CASE("ggml_executor: inline float weights are read in place, not copied per
 
 // Attention at long texts: the unfused lowering materialises the [heads, S, S] scores and runs four passes over them (QK^T, scale, mask,
 // softmax) before PV. The CPU lowering recognises the exported pattern and emits one ggml_flash_attn_ext (the goldens above hold it to
-// ORT's unfused kernels). It fuses only a 0/-max mask from Where (an F16 mask would round a real-valued bias), and only on the plain CPU
-// path: a device keeps the lowering its plugins were verified with.
+// ORT's unfused kernels). It fuses only a 0/-max mask from Where (an F16 mask would round a real-valued bias), and only on ggml's CPU
+// backend ("cpu" and the scheduler path "cpu-sched"): a GPU device keeps the lowering its plugins were verified with.
 TEST_CASE("ggml_lowering: scaled-dot-product attention fuses into one flash attention on the CPU", "[adapter][ggml][ggml_ops][attention]") {
 	struct Want {
 		const char *stem;
@@ -943,7 +943,7 @@ TEST_CASE("ggml_lowering: scaled-dot-product attention fuses into one flash atte
 			const auto ops = executor.GraphOpCounts(c.inputs, GgmlRunOptions {});
 			const int fused = ops.count("FLASH_ATTN_EXT") ? ops.at("FLASH_ATTN_EXT") : 0;
 			const int softmax = ops.count("SOFT_MAX") ? ops.at("SOFT_MAX") : 0;
-			const int want = device == "cpu" ? w.fused : 0;
+			const int want = w.fused; // "cpu-sched" runs on the CPU backend too: both paths fuse, so they stay bit-identical
 			REQUIRE(fused == want);
 			REQUIRE(softmax == 1 - want); // the unfused chain is not computed next to the fused op
 		}
