@@ -4,7 +4,11 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
+#include <set>
+#include <thread>
+#include <utility>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -21,6 +25,9 @@
 #endif
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
+#endif
+#if defined(__linux__)
+#include <sched.h>
 #endif
 
 namespace anofox {
@@ -259,6 +266,70 @@ void ProbeMlxDevices(std::vector<DeviceInfo> &devices) {
 
 bool CudaComputeCapabilityUsable(int major, int minor) {
 	return major * 10 + minor >= 75;
+}
+
+int PhysicalCpuCoresFrom(const std::string &cpu_dir, const std::vector<int> &allowed) {
+	namespace fs = std::filesystem;
+	const std::set<int> allow(allowed.begin(), allowed.end());
+	std::set<std::pair<long, long>> cores; // (package, core): core ids repeat across packages
+	std::error_code ec;
+	for (fs::directory_iterator it(cpu_dir, ec), end; !ec && it != end; it.increment(ec)) {
+		const std::string name = it->path().filename().string();
+		if (name.size() < 4 || name.compare(0, 3, "cpu") != 0 ||
+		    !std::all_of(name.begin() + 3, name.end(), [](unsigned char c) { return std::isdigit(c) != 0; })) {
+			continue; // cpufreq, cpuidle, ...
+		}
+		const int index = std::atoi(name.c_str() + 3);
+		if (!allow.empty() && !allow.count(index)) {
+			continue;
+		}
+		long package = -1, core = -1;
+		std::ifstream(it->path() / "topology" / "physical_package_id") >> package;
+		std::ifstream(it->path() / "topology" / "core_id") >> core;
+		if (core >= 0) {
+			cores.insert({package, core});
+		}
+	}
+	return static_cast<int>(cores.size());
+}
+
+int PhysicalCpuCores() {
+	static const int cores = [] {
+		int n = 0;
+#if defined(__linux__)
+		std::vector<int> allowed; // the cpus a taskset / cpuset leaves this process
+		cpu_set_t set;
+		if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+			for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+				if (CPU_ISSET(cpu, &set)) {
+					allowed.push_back(cpu);
+				}
+			}
+		}
+		n = PhysicalCpuCoresFrom("/sys/devices/system/cpu", allowed);
+#elif defined(__APPLE__)
+		int value = 0;
+		size_t size = sizeof(value);
+		if (sysctlbyname("hw.physicalcpu", &value, &size, nullptr, 0) == 0) {
+			n = value;
+		}
+#elif defined(_WIN32)
+		DWORD bytes = 0;
+		GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &bytes);
+		std::vector<char> buffer(bytes);
+		if (bytes > 0 && GetLogicalProcessorInformationEx(RelationProcessorCore,
+		                                                  reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data()), &bytes)) {
+			for (DWORD offset = 0; offset < bytes;) {
+				auto *info = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data() + offset);
+				n++;
+				offset += info->Size;
+			}
+		}
+#endif
+		const int logical = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+		return n > 0 ? std::min(n, logical) : logical;
+	}();
+	return cores;
 }
 
 const std::vector<std::string> &GgmlRocmPluginArchs() {

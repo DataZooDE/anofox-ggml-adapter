@@ -11,6 +11,9 @@
 - `Flatten` and `Split` (the `split` input, the attribute and opset 18's `num_outputs`, zero-size parts); data inputs typed by the
   graph (int64 token ids, bool masks); `GgmlExecutor::InitializerCopyBytes()`.
 
+- `PhysicalCpuCores()` (devices.hpp): the physical cores this process may use, SMT siblings counted once (sysfs topology within the
+  process's affinity on Linux, `hw.physicalcpu` on macOS, the processor-core records on Windows). The CPU engine is fastest at one
+  thread per physical core; hosts cap their engine threads with it.
 - The MLX graph interpreter runs `Flatten` and `Split` (the ops anofox-decide's graphs need), checked bit for bit against the ONNX
   Runtime goldens by the new `mlx_tests` (tools/mlx_plugin `-DANOFOX_MLX_TESTS=ON`; run in the MLX plugin CI job).
 

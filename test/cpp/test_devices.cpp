@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <set>
+#include <thread>
 
 using namespace anofox::ggml_adapter;
 
@@ -38,7 +39,38 @@ std::string FakeKfdTopology(const std::string &tag, const std::vector<std::pair<
 	return root.string();
 }
 
+//! A fake /sys/devices/system/cpu: cpuN/topology/{physical_package_id,core_id} for each (package, core) pair, cpu index = position.
+std::string FakeCpuTopology(const std::string &tag, const std::vector<std::pair<int, int>> &cpus) {
+	namespace fs = std::filesystem;
+	const fs::path root = fs::temp_directory_path() / ("anofox_ggml_fake_cpu_" + tag);
+	fs::remove_all(root);
+	for (size_t i = 0; i < cpus.size(); i++) {
+		const fs::path dir = root / ("cpu" + std::to_string(i)) / "topology";
+		fs::create_directories(dir);
+		std::ofstream(dir / "physical_package_id") << cpus[i].first << "\n";
+		std::ofstream(dir / "core_id") << cpus[i].second << "\n";
+	}
+	fs::create_directories(root / "cpufreq"); // not a cpuN directory: ignored
+	return root.string();
+}
+
 } // namespace
+
+TEST_CASE("devices: physical cores count SMT siblings once, per package, within the allowed cpus", "[adapter][devices]") {
+	// 4 cores with 2 threads each, siblings numbered apart as Linux does (cpu0/cpu4 share core 0)
+	const auto smt = FakeCpuTopology("smt", {{0, 0}, {0, 1}, {0, 2}, {0, 3}, {0, 0}, {0, 1}, {0, 2}, {0, 3}});
+	REQUIRE(PhysicalCpuCoresFrom(smt, {}) == 4);
+	// a taskset/cpuset that allows both threads of one core and one thread of another: two cores
+	REQUIRE(PhysicalCpuCoresFrom(smt, {0, 4, 1}) == 2);
+	// core ids repeat across packages: two sockets of two cores are four cores
+	const auto sockets = FakeCpuTopology("sockets", {{0, 0}, {0, 1}, {1, 0}, {1, 1}});
+	REQUIRE(PhysicalCpuCoresFrom(sockets, {}) == 4);
+	// no topology at all: 0, so the caller falls back
+	REQUIRE(PhysicalCpuCoresFrom((std::filesystem::temp_directory_path() / "anofox_ggml_no_such_cpu_dir").string(), {}) == 0);
+	// on this machine: at least one core, never more than the hardware threads
+	REQUIRE(PhysicalCpuCores() >= 1);
+	REQUIRE(PhysicalCpuCores() <= static_cast<int>(std::max(1u, std::thread::hardware_concurrency())));
+}
 
 TEST_CASE("devices: every compute-capable KFD node is a rocm device, usable when the plugin carries its architecture", "[adapter][devices]") {
 	const auto root = FakeKfdTopology("two_gpus", {{110500, 64}, {120001, 2048}, {90000, 0}, {100306, 4}});

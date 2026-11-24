@@ -32,6 +32,16 @@ std::vector<DeviceInfo> DiscoverRocmDevicesFrom(const std::string &nodes_path, c
 //! The plugin is built for sm_75 (Turing) and newer: an older card has no kernel image.
 bool CudaComputeCapabilityUsable(int major, int minor);
 
+//! The number of physical CPU cores this process may run on (SMT siblings counted once), at least 1. The CPU engine is fastest with
+//! one thread per physical core: on an SMT machine a second thread per core adds no arithmetic throughput, and every op's barrier
+//! waits for the slowest thread (measured on a 12-core / 24-thread Ryzen AI: 25 s at 12 threads, 35 s at 24, the same answers).
+//! Linux reads sysfs topology, macOS hw.physicalcpu, Windows the logical processor information; std::thread's count elsewhere.
+int PhysicalCpuCores();
+
+//! PhysicalCpuCores() over a sysfs cpu directory (a test seam: /sys/devices/system/cpu on a real machine), counting the distinct
+//! (package, core) pairs among the cpus `allowed` says this process may use (empty: all). 0 when the directory has no topology.
+int PhysicalCpuCoresFrom(const std::string &cpu_dir, const std::vector<int> &allowed);
+
 //! The gfx architectures the released ROCm plugin carries code objects for.
 const std::vector<std::string> &GgmlRocmPluginArchs();
 bool RocmArchUsable(const std::string &arch);
