@@ -78,6 +78,18 @@ TEST_CASE("plugin_host: every failure is a PluginError with a kind the host can 
 			REQUIRE(e.plugin_abi == ANOFOX_GGML_PLUGIN_ABI_VERSION + 1);
 		}
 	}
+	SECTION("a plugin built from another revision of the ABI header (same version, other struct layout) is refused") {
+		// the version alone cannot catch this: both say 3, but every weight the host passes would be read at the wrong stride
+		try {
+			PluginSession::Open(ANOFOX_FAKE_PLUGIN_BAD_LAYOUT, Params());
+			FAIL("expected a refusal");
+		} catch (const PluginError &e) {
+			REQUIRE(e.kind == PluginError::Kind::ABI_MISMATCH);
+			REQUIRE(e.detail.find("layout") != std::string::npos);
+		}
+		std::string why;
+		REQUIRE_FALSE(PluginLoadable(ANOFOX_FAKE_PLUGIN_BAD_LAYOUT, &why));
+	}
 	SECTION("a library that is no plugin") {
 		REQUIRE(KindOf([] { PluginSession::Open(ANOFOX_NOT_A_PLUGIN, Params()); }) == PluginError::Kind::NOT_A_PLUGIN);
 	}

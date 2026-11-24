@@ -114,6 +114,13 @@ const AnofoxGgmlPluginApi *LoadApi(const std::string &path, LibraryHandle &libra
 		                      std::to_string(ANOFOX_GGML_PLUGIN_ABI_VERSION),
 		                  std::string(), plugin_abi);
 	}
+	if (api->layout != ANOFOX_GGML_PLUGIN_LAYOUT) {
+		CloseLibrary(library);
+		throw PluginError(PluginError::Kind::ABI_MISMATCH,
+		                  "built from another revision of plugin ABI version " + std::to_string(ANOFOX_GGML_PLUGIN_ABI_VERSION) +
+		                      " (its struct layout differs from this build's)",
+		                  std::string(), ANOFOX_GGML_PLUGIN_ABI_VERSION);
+	}
 	return api;
 }
 

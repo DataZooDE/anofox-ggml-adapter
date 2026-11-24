@@ -184,8 +184,13 @@ constexpr int kAbi = ANOFOX_GGML_PLUGIN_ABI_VERSION + 1;
 #else
 constexpr int kAbi = ANOFOX_GGML_PLUGIN_ABI_VERSION;
 #endif
+#ifdef ANOFOX_FAKE_PLUGIN_BAD_LAYOUT
+const uint32_t kLayout = ANOFOX_GGML_PLUGIN_LAYOUT + 1; // a plugin built from another revision of the header
+#else
+const uint32_t kLayout = ANOFOX_GGML_PLUGIN_LAYOUT;
+#endif
 
-const AnofoxGgmlPluginApi kApi = {kAbi, PluginName, PluginCreate, PluginGraphInputs, PluginRun, PluginFreeOutput, PluginDestroy};
+const AnofoxGgmlPluginApi kApi = {kAbi, kLayout, PluginName, PluginCreate, PluginGraphInputs, PluginRun, PluginFreeOutput, PluginDestroy};
 
 } // namespace
 

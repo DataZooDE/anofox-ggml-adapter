@@ -99,8 +99,16 @@ typedef struct {
 	size_t count;
 } AnofoxGgmlRunOutput;
 
+/* A fingerprint of every struct that crosses the boundary. The version says which ABI a plugin speaks; this catches a plugin built
+ * from another revision of this header at the same version (a field added before a release), whose structs the host would read at
+ * the wrong size. Checked right after abi_version. */
+#define ANOFOX_GGML_PLUGIN_LAYOUT                                                                                                  \
+	((uint32_t)((sizeof(AnofoxGgmlCreateParams) << 20) ^ (sizeof(AnofoxGgmlWeight) << 13) ^ (sizeof(AnofoxGgmlTensorIn) << 6) ^    \
+	            sizeof(AnofoxGgmlTensorOut) ^ (sizeof(AnofoxGgmlRunOutput) << 26)))
+
 typedef struct {
 	int abi_version; /* the ONLY field a host reads before checking it */
+	uint32_t layout; /* ANOFOX_GGML_PLUGIN_LAYOUT of the header the plugin was built with; checked right after abi_version */
 	const char *(*name)(void);
 	void *(*create)(const AnofoxGgmlCreateParams *params, char *err, size_t err_len);
 	/* The graph's inputs (initializers excluded), NULL-terminated, owned by the handle: the host checks its contract with them. */

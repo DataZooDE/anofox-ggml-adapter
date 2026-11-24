@@ -373,7 +373,7 @@ void PluginDestroy(void *handle) {
 	delete static_cast<Backend *>(handle);
 }
 
-const AnofoxGgmlPluginApi kApi = {ANOFOX_GGML_PLUGIN_ABI_VERSION, PluginName, PluginCreate, PluginGraphInputs,
+const AnofoxGgmlPluginApi kApi = {ANOFOX_GGML_PLUGIN_ABI_VERSION, ANOFOX_GGML_PLUGIN_LAYOUT, PluginName, PluginCreate, PluginGraphInputs,
                                   PluginRun,                      PluginFreeOutput, PluginDestroy};
 
 } // namespace

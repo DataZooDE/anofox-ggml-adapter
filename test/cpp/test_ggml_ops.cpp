@@ -457,6 +457,15 @@ int ProcessThreadCount() {
 TEST_CASE("ggml_executor: a bad device or device number throws, names the problem and leaks no worker threads", "[adapter][ggml][ggml_ops]") {
 	const auto g = ExpNegAddGraph();
 	const std::vector<float> weights = {1.0f, 2.0f, 3.0f};
+	{
+		// One failure first: a runtime may start a helper thread of its own the first time a pool comes up (seen once, +2, on GitHub's
+		// x86 runners). What must not happen is growth PER failure, which 120 failures with a 4-thread pool would make plain.
+		GgmlExecutorConfig warm;
+		warm.threads = 4;
+		warm.device = "bogus";
+		warm.weights = [&](const std::string &, const std::vector<int64_t> &) { return ExternalWeight {weights.data(), 3}; };
+		REQUIRE_THROWS(GgmlExecutor(g, warm));
+	}
 	const int before = ProcessThreadCount();
 	for (const char *device : {"bogus", "gpu:abc", "gpu:-1", "gpu: 1", "gpu:1x", "gpu:"}) {
 		GgmlExecutorConfig config;

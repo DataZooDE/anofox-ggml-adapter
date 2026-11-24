@@ -28,12 +28,13 @@ if(ANOFOX_GGML_ADAPTER_TESTS)
     target_link_libraries(adapter_tests PRIVATE anofox_ggml)
     # The plugin loader is tested against real libraries: the fake plugin, the same source built against another ABI version, and a
     # shared library that is no plugin at all.
-    foreach(_fake fake_plugin fake_plugin_bad_abi)
+    foreach(_fake fake_plugin fake_plugin_bad_abi fake_plugin_bad_layout)
         add_library(${_fake} MODULE test/cpp/plugin_fixture/fake_plugin.cpp)
         target_include_directories(${_fake} PRIVATE "${ANOFOX_GGML_ADAPTER_INCLUDE_DIR}")
         set_target_properties(${_fake} PROPERTIES CXX_VISIBILITY_PRESET hidden PREFIX "lib")
     endforeach()
     target_compile_definitions(fake_plugin_bad_abi PRIVATE ANOFOX_FAKE_PLUGIN_BAD_ABI)
+    target_compile_definitions(fake_plugin_bad_layout PRIVATE ANOFOX_FAKE_PLUGIN_BAD_LAYOUT)
     add_library(not_a_plugin MODULE test/cpp/plugin_fixture/not_a_plugin.cpp)
     set_target_properties(not_a_plugin PROPERTIES PREFIX "lib")
     # The generic ggml plugin itself, built for the CPU device: CI runs the real plugin code end to end without a GPU.
@@ -42,10 +43,11 @@ if(ANOFOX_GGML_ADAPTER_TESTS)
     target_compile_definitions(ggml_plugin_cpu PRIVATE ANOFOX_GGML_PLUGIN_CPU_TEST)
     target_link_libraries(ggml_plugin_cpu PRIVATE anofox_ggml)
     set_target_properties(ggml_plugin_cpu PROPERTIES CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON PREFIX "lib")
-    add_dependencies(adapter_tests fake_plugin fake_plugin_bad_abi not_a_plugin ggml_plugin_cpu)
+    add_dependencies(adapter_tests fake_plugin fake_plugin_bad_abi fake_plugin_bad_layout not_a_plugin ggml_plugin_cpu)
     target_compile_definitions(adapter_tests PRIVATE
         ANOFOX_FAKE_PLUGIN="$<TARGET_FILE:fake_plugin>"
         ANOFOX_FAKE_PLUGIN_BAD_ABI="$<TARGET_FILE:fake_plugin_bad_abi>"
+        ANOFOX_FAKE_PLUGIN_BAD_LAYOUT="$<TARGET_FILE:fake_plugin_bad_layout>"
         ANOFOX_NOT_A_PLUGIN="$<TARGET_FILE:not_a_plugin>"
         ANOFOX_GGML_CPU_PLUGIN="$<TARGET_FILE:ggml_plugin_cpu>")
     target_link_libraries(adapter_tests PRIVATE ${CMAKE_DL_LIBS})

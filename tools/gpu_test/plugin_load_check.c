@@ -41,6 +41,11 @@ int main(int argc, char **argv) {
 		printf("LOAD_CHECK_FAIL abi_version %d, harness built against %d\n", api->abi_version, ANOFOX_GGML_PLUGIN_ABI_VERSION);
 		return 1;
 	}
+	if (api->layout != ANOFOX_GGML_PLUGIN_LAYOUT) {
+		printf("LOAD_CHECK_FAIL layout %u, harness built with %u (another revision of the ABI header)\n", api->layout,
+		       (unsigned)ANOFOX_GGML_PLUGIN_LAYOUT);
+		return 1;
+	}
 	printf("LOAD_CHECK_OK name=%s abi=%d\n", api->name ? api->name() : "(null)", api->abi_version);
 	AnofoxGgmlCreateParams params;
 	memset(&params, 0, sizeof(params));
