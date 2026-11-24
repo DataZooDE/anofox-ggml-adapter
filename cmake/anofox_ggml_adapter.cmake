@@ -28,7 +28,8 @@ set(ANOFOX_GGML_ADAPTER_SOURCES
     "${ANOFOX_GGML_ADAPTER_DIR}/src/onnx_reader.cpp"
     "${ANOFOX_GGML_ADAPTER_DIR}/src/ggml_engine.cpp"
     "${ANOFOX_GGML_ADAPTER_DIR}/src/cpu_support.cpp"
-    "${ANOFOX_GGML_ADAPTER_DIR}/src/plugin_host.cpp")
+    "${ANOFOX_GGML_ADAPTER_DIR}/src/plugin_host.cpp"
+    "${ANOFOX_GGML_ADAPTER_DIR}/src/devices.cpp")
 if(TARGET anofox_ggml)
     return()
 endif()

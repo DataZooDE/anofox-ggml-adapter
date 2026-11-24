@@ -21,6 +21,7 @@ if(ANOFOX_GGML_ADAPTER_TESTS)
         test/cpp/test_plugin_host.cpp
         test/cpp/test_plugin_ggml.cpp
         test/cpp/test_plugin_artifacts.cpp
+        test/cpp/test_devices.cpp
         ${ANOFOX_GGML_ADAPTER_SOURCES})
     add_dependencies(adapter_tests ggml)
     target_include_directories(adapter_tests PRIVATE test/cpp)
