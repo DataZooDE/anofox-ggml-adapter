@@ -3,6 +3,9 @@
 #include "anofox_ggml_adapter/rank_reduce.hpp"
 #include "anofox_ggml_adapter/shape_eval.hpp"
 
+#if defined(__APPLE__) && defined(ANOFOX_GGML_ACCELERATE)
+#include <Accelerate/Accelerate.h>
+#endif
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
@@ -199,6 +202,22 @@ void ElementwiseKernel(ggml_tensor *dst, int ith, int nth, void *userdata) {
 		}
 	}
 }
+
+#if defined(__APPLE__) && defined(ANOFOX_GGML_ACCELERATE)
+//! dst = activations x weight^T through Apple's Accelerate (its SGEMM runs on the M-series matrix units and threads itself), for a float32
+//! 2-D weight: the ggml_mul_mat contract (dst ne [N, M...] from weight ne [K, N] and activations ne [K, M...]). One task: ggml's other
+//! threads wait at the barrier while Accelerate works.
+void AccelerateMulMatKernel(ggml_tensor *dst, int ith, int /*nth*/, void * /*userdata*/) {
+	if (ith != 0) {
+		return;
+	}
+	const ggml_tensor *w = dst->src[0], *a = dst->src[1];
+	const int K = static_cast<int>(w->ne[0]), N = static_cast<int>(w->ne[1]);
+	const int M = static_cast<int>(a->ne[1] * a->ne[2] * a->ne[3]);
+	cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, M, N, K, 1.0f, static_cast<const float *>(a->data), K,
+	            static_cast<const float *>(w->data), K, 0.0f, static_cast<float *>(dst->data), N);
+}
+#endif
 
 enum RowOp : intptr_t { R_MAX, R_MIN, R_PROD };
 
@@ -590,6 +609,7 @@ void FlatOpKernel(ggml_tensor *dst, int ith, int /*nth*/, void *userdata) {
 struct Lowering {
 	ggml_context *ctx;
 	bool strict_fp32 = false; // see GgmlExecutorConfig::strict_fp32
+	bool accelerate = false;  // Apple builds on the CPU backend: 2-D float32 weight matmuls through Accelerate (ANOFOX_GGML_NO_ACCELERATE=1: off)
 	std::unordered_map<std::string, ShapeValue> shapes;
 	std::unordered_map<std::string, ggml_tensor *> tensors;
 	std::unordered_map<const ggml_tensor *, ggml_tensor *> transposed_from; // copy -> the tensor whose last two dimensions it swapped
@@ -856,6 +876,20 @@ struct Lowering {
 	//! `weight` x `activations` through ggml's matmul. Strict fp32 (GgmlExecutorConfig::strict_fp32) pads the activations to ggml's cuBLAS threshold of 17 rows
 	//! (ggml's CUDA small-batch kernel, at 16 rows or fewer, runs TF32 tensor-core instructions) and slices the extra zero rows off the result.
 	ggml_tensor *MulMat(ggml_tensor *weight, ggml_tensor *activations) {
+#if defined(__APPLE__) && defined(ANOFOX_GGML_ACCELERATE)
+		// Real matrix products only: Accelerate's matrix-vector kernels (one output column, or a single activation row) round differently
+		// depending on the activations' alignment, which differs between the plain and the scheduler path; every shape with at least two
+		// rows and two columns was bit-stable across alignments (measured on an M3). A vector product is memory-bound anyway.
+		const int64_t act_rows = activations->ne[1] * activations->ne[2] * activations->ne[3];
+		if (accelerate && weight->type == GGML_TYPE_F32 && activations->type == GGML_TYPE_F32 && weight->ne[2] == 1 && weight->ne[3] == 1 &&
+		    weight->ne[1] >= 2 && act_rows >= 2 && ggml_is_contiguous(weight)) {
+			ggml_tensor *a = Contiguous(activations);
+			ggml_tensor *args[2] = {weight, a};
+			ggml_tensor *t = ggml_custom_4d(ctx, GGML_TYPE_F32, weight->ne[1], a->ne[1], a->ne[2], a->ne[3], args, 2, AccelerateMulMatKernel, 1, nullptr);
+			ggml_set_name(t, "accelerate_sgemm");
+			return t;
+		}
+#endif
 		constexpr int64_t kSmallBatchRows = 16;
 		const int64_t rows = activations->ne[1];
 		if (!strict_fp32 || rows > kSmallBatchRows) {
@@ -1564,6 +1598,7 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 	Lowering low;
 	low.ctx = ctx.get();
 	low.strict_fp32 = options.strict_fp32;
+	low.accelerate = (options.device == "cpu" || options.device == "cpu-sched") && !EnvAlias("ANOFOX_GGML_NO_ACCELERATE", "ANOFOX_GGML_NO_ACCELERATE");
 	low.shapes = std::move(evaluated.values);
 
 	// Leaves: graph inputs and float initializers. Their data is copied in after the allocator placed them.

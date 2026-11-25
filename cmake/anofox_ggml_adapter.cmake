@@ -98,3 +98,9 @@ set(_anofox_ggml_libs "$<TARGET_FILE:ggml>;$<TARGET_FILE:ggml-cpu>;$<TARGET_FILE
 set_target_properties(anofox_ggml PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES "${ANOFOX_GGML_ADAPTER_INCLUDE_DIR};${ANOFOX_GGML_ADAPTER_DIR}/vendor/ggml/include"
     INTERFACE_LINK_LIBRARIES "${_anofox_ggml_libs};Threads::Threads;${CMAKE_DL_LIBS}")
+if(APPLE)
+    # The engine's 2-D weight matmuls run on Apple's Accelerate SGEMM (the M-series matrix units): ggml's own float32 path was ~1.7x
+    # slower than ONNX Runtime's on an M3. The engine sources are compiled into each consumer, which links this target.
+    set_property(TARGET anofox_ggml APPEND PROPERTY INTERFACE_COMPILE_DEFINITIONS ANOFOX_GGML_ACCELERATE ACCELERATE_NEW_LAPACK)
+    set_property(TARGET anofox_ggml APPEND PROPERTY INTERFACE_LINK_LIBRARIES "-framework Accelerate")
+endif()
