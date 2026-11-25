@@ -922,7 +922,7 @@ TEST_CASE("ggml_executor: inline float weights are read in place, not copied per
 // Attention at long texts: the unfused lowering materialises the [heads, S, S] scores and runs four passes over them (QK^T, scale, mask,
 // softmax) before PV. The CPU lowering recognises the exported pattern and emits one ggml_flash_attn_ext (the goldens above hold it to
 // ORT's unfused kernels). It fuses only a 0/-max mask from Where (an F16 mask would round a real-valued bias), and only on ggml's CPU
-// backend ("cpu" and the scheduler path "cpu-sched"): a GPU device keeps the lowering its plugins were verified with.
+// backend ("cpu" and the scheduler path "cpu-sched"); a GPU keeps the unfused attention (its kernels lose precision).
 TEST_CASE("ggml_lowering: scaled-dot-product attention fuses into one flash attention on the CPU", "[adapter][ggml][ggml_ops][attention]") {
 	struct Want {
 		const char *stem;
@@ -1021,5 +1021,183 @@ TEST_CASE("ggml_lowering: a fused attention row does not depend on how many quer
 			INFO("batch " << b << " element " << i << ": " << row0[b][i] << " vs " << row0[0][i]);
 			REQUIRE(SameBits(row0[b][i], row0[0][i]));
 		}
+	}
+}
+
+TEST_CASE("ggml_lowering: the fused attention copies no activations around it", "[adapter][ggml][ggml_ops][attention]") {
+	// K arrives as the graph's Transpose(K) copy, which the fusion transposes back; Q/V/K are contiguous graph inputs here, the scores are
+	// never materialised, and the output's layout is what the consumer wants. Each avoidable copy is a full [B, S, H*D] pass per layer.
+	for (const char *stem : {"sdpa_band_keypad_tiled", "sdpa_keypad_short_swapped", "sdpa_no_mask"}) {
+		INFO("case " << stem);
+		const std::string path = std::string("test/fixtures/ggml_ops/") + stem;
+		const Case c = ReadCase(path);
+		const auto graph = ReadGraph(path);
+		GgmlExecutorConfig config;
+		config.threads = 2;
+		GgmlExecutor executor(graph, config);
+		const auto ops = executor.GraphOpCounts(c.inputs, GgmlRunOptions {});
+		INFO("CONT nodes: " << (ops.count("CONT") ? ops.at("CONT") : 0));
+		REQUIRE(ops.count("FLASH_ATTN_EXT") == 1);
+		// one copy remains: the graph output itself (the fused result is a permuted view; the caller gets it contiguous)
+		REQUIRE(ops.count("CONT") == 1);
+		REQUIRE(ops.at("CONT") == 1);
+	}
+}
+
+TEST_CASE("ggml_lowering: the exact-GELU pattern lowers to one gelu_erf", "[adapter][ggml][ggml_ops][gelu]") {
+	// Five ops, three of them CPU-only custom kernels over the MLP activations, become one native unary op (multi-threaded on the CPU,
+	// on the device for the GPU plugins). The goldens above hold its values to ONNX Runtime's.
+	for (const char *stem : {"gelu_erf_pattern", "gelu_erf_pattern_swapped"}) {
+		const std::string path = std::string("test/fixtures/ggml_ops/") + stem;
+		const Case c = ReadCase(path);
+		const auto graph = ReadGraph(path);
+		for (const std::string device : {"cpu", "cpu-sched"}) {
+			INFO("case " << stem << ", device " << device);
+			GgmlExecutorConfig config;
+			config.threads = 2;
+			config.device = device;
+			GgmlExecutor executor(graph, config);
+			const auto ops = executor.GraphOpCounts(c.inputs, GgmlRunOptions {});
+			REQUIRE(ops.count("UNARY") == 1);
+			REQUIRE(ops.count("CUSTOM") == 0);
+		}
+	}
+}
+
+TEST_CASE("ggml_lowering: token ids from a graph input gather an embedding with get_rows, and an out-of-range id is refused", "[adapter][ggml][ggml_ops][embedding]") {
+	// The embedding lookup was a single-threaded host kernel; on a GPU it made the scheduler copy the whole table to the host every run.
+	const std::string stem = "test/fixtures/ggml_ops/gather_input_ids_embedding"; // table [11, 6], ids [2, 5] int64 graph input
+	const Case c = ReadCase(stem);
+	const auto graph = ReadGraph(stem);
+	for (const std::string device : {"cpu", "cpu-sched"}) {
+		INFO("device " << device);
+		GgmlExecutorConfig config;
+		config.threads = 2;
+		config.device = device;
+		GgmlExecutor executor(graph, config);
+		const auto ops = executor.GraphOpCounts(c.inputs, GgmlRunOptions {});
+		REQUIRE(ops.count("GET_ROWS") == 1);
+		REQUIRE(ops.count("CUSTOM") == 0);
+		HostTensors bad = c.inputs;
+		bad.at("ids").data[3] = 11.0f; // one past the table
+		try {
+			executor.Run(bad, GgmlRunOptions {});
+			FAIL("an out-of-range token id was accepted");
+		} catch (const std::exception &e) {
+			INFO(e.what());
+			REQUIRE(std::string(e.what()).find("out of range") != std::string::npos);
+			REQUIRE(std::string(e.what()).find("11") != std::string::npos);
+		}
+		const auto out = executor.Run(c.inputs, GgmlRunOptions {}); // a refused run does not poison the next
+		REQUIRE(SameBits(out.at("y").data[0], c.outputs.at("y").data[0]));
+	}
+}
+
+TEST_CASE("ggml_executor: one activation arena serves every cached shape, sized for the largest", "[adapter][ggml][ggml_ops][arena]") {
+	// Each cached input shape kept its own arena: a host scoring texts of many lengths held up to cache_entries arenas at once.
+	::anofox::onnxread::Graph g;
+	g.inputs = {"x"};
+	g.nodes = {MakeNode("Exp", {"x"}, "e"), MakeNode("Mul", {"e", "x"}, "m"), MakeNode("Add", {"m", "e"}, "y")};
+	g.outputs = {"y"};
+	auto input = [](int64_t rows) {
+		HostTensors in;
+		in["x"] = HostTensor {{rows, 256}, std::vector<float>(static_cast<size_t>(rows * 256), 0.5f)};
+		return in;
+	};
+	GgmlExecutorConfig config;
+	config.threads = 2;
+	config.cache_entries = 4;
+	size_t large_alone = 0;
+	{
+		GgmlExecutor alone(g, config);
+		alone.Run(input(512), GgmlRunOptions {});
+		large_alone = alone.ActivationBytes();
+		REQUIRE(large_alone > 0);
+	}
+	GgmlExecutor executor(g, config);
+	std::vector<float> first;
+	for (int64_t rows : {512, 8, 64, 512, 8}) {
+		const auto out = executor.Run(input(rows), GgmlRunOptions {});
+		REQUIRE(out.at("y").data.size() == static_cast<size_t>(rows * 256));
+		const float want = std::exp(0.5f) * 0.5f + std::exp(0.5f);
+		REQUIRE(std::fabs(out.at("y").data.back() - want) < 1e-5f); // each shape still computes on a valid plan of its own graph
+	}
+	REQUIRE(executor.CompileCount() == 3);
+	REQUIRE(executor.ActivationBytes() == large_alone);
+}
+
+TEST_CASE("ggml_executor: on a device, a float32 initializer takes 16-bit data and inline weights are uploaded once", "[adapter][ggml][ggml_ops][device_weights]") {
+	// A host's 16-bit checkpoint for a float32 graph (decide's Laya models on a GPU): the device upload upcasts it.
+	const std::vector<uint16_t> f16 = {0x3C00, 0x4000, 0x4200, 0x4400, 0x4500, 0x4600}; // 1..6
+	::anofox::onnxread::Graph g;
+	g.inputs = {"x"};
+	::anofox::onnxread::Tensor t;
+	t.name = "w";
+	t.dims = {3, 2};
+	t.data_type = 1;
+	t.location = ::anofox::onnxread::DataLocation::EXTERNAL;
+	g.initializers.push_back(t);
+	g.nodes = {MakeNode("MatMul", {"x", "w"}, "y")};
+	g.outputs = {"y"};
+	HostTensors in;
+	in["x"] = {{2, 3}, {1.0f, 0.5f, -1.0f, 2.0f, 0.0f, 3.0f}};
+	GgmlExecutorConfig config;
+	config.threads = 2;
+	config.device = "cpu-sched";
+	config.weights = [&](const std::string &, const std::vector<int64_t> &) { return ExternalWeight {reinterpret_cast<const float *>(f16.data()), 6, 10}; };
+	GgmlExecutor executor(g, config);
+	const auto out = executor.Run(in, GgmlRunOptions());
+	REQUIRE(out.at("y").data == std::vector<float> {1.0f * 1 + 0.5f * 3 - 1.0f * 5, 1.0f * 2 + 0.5f * 4 - 1.0f * 6, 2.0f * 1 + 3.0f * 5, 2.0f * 2 + 3.0f * 6});
+
+	// A registered full graph keeps its weights inline: on a device they were re-uploaded with every run (the whole model per call).
+	::anofox::onnxread::Graph full;
+	full.inputs = {"x"};
+	::anofox::onnxread::Tensor w;
+	w.name = "w";
+	w.dims = {256, 256};
+	w.data_type = 1;
+	std::vector<float> wv(256 * 256, 0.01f);
+	w.raw.assign(reinterpret_cast<const char *>(wv.data()), wv.size() * sizeof(float));
+	full.initializers.push_back(w);
+	full.nodes = {MakeNode("MatMul", {"x", "w"}, "y")};
+	full.outputs = {"y"};
+	GgmlExecutorConfig device;
+	device.threads = 2;
+	device.device = "cpu-sched";
+	GgmlExecutor inline_executor(full, device);
+	HostTensors xin;
+	xin["x"] = {{4, 256}, std::vector<float>(4 * 256, 1.0f)};
+	inline_executor.Run(xin, GgmlRunOptions());
+	const size_t after_first = inline_executor.UploadedBytes();
+	REQUIRE(after_first >= wv.size() * sizeof(float));
+	inline_executor.Run(xin, GgmlRunOptions());
+	inline_executor.Run(xin, GgmlRunOptions());
+	REQUIRE(inline_executor.UploadedBytes() - after_first == 2 * 4 * 256 * sizeof(float)); // later runs move only the input
+}
+
+TEST_CASE("ggml_executor: a graph planned before the shared arena grew runs on the new buffer, not the freed one", "[adapter][ggml][ggml_ops][arena]") {
+	// The allocator treats a tensor that has data as allocated: after a larger graph made the arena reallocate, a smaller graph's
+	// intermediates still pointed into the freed old buffer and computed there (heap-use-after-free in anofox-tabfm's cobatch test).
+	// Sizes above glibc's 128 KB mmap threshold: the old buffer is unmapped, so a stale pointer crashes instead of passing silently.
+	::anofox::onnxread::Graph g;
+	g.inputs = {"x"};
+	g.nodes = {MakeNode("Exp", {"x"}, "e"), MakeNode("Mul", {"e", "x"}, "m"), MakeNode("Add", {"m", "e"}, "y")};
+	g.outputs = {"y"};
+	auto input = [](int64_t rows) {
+		HostTensors in;
+		in["x"] = HostTensor {{rows, 256}, std::vector<float>(static_cast<size_t>(rows * 256), 0.5f)};
+		return in;
+	};
+	GgmlExecutorConfig config;
+	config.threads = 2;
+	config.cache_entries = 4;
+	GgmlExecutor executor(g, config);
+	const float want = std::exp(0.5f) * 0.5f + std::exp(0.5f);
+	for (int64_t rows : {256, 4096, 256, 8192, 256}) { // small, larger (the arena grows), small again, ...
+		INFO("rows " << rows);
+		const auto out = executor.Run(input(rows), GgmlRunOptions {});
+		REQUIRE(out.at("y").data.size() == static_cast<size_t>(rows * 256));
+		REQUIRE(std::fabs(out.at("y").data.front() - want) < 1e-5f);
+		REQUIRE(std::fabs(out.at("y").data.back() - want) < 1e-5f);
 	}
 }

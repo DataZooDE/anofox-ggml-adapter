@@ -786,4 +786,34 @@ def single_query_case(name):
 
 single_query_case("sdpa_single_query_split_kv")
 
+
+
+# Exact GELU as the ModernBERT/mmBERT exports spell it: Mul(Mul(x, Add(Erf(Div(x, sqrt 2)), 1)), 0.5). The lowering fuses it into
+# ggml_gelu_erf (one pass instead of five, and native on CUDA/HIP), which computes erf(x * 0.70710678) rather than erf(x / 1.4142135):
+# within ~1 ulp of the argument, so this golden is held at Erf's tolerance, not bit for bit (accepted by the user, eval-gated).
+def gelu_case(name, x, swapped=False):
+    nodes = [helper.make_node("Div", ["x", "sqrt2"], ["d"]), helper.make_node("Erf", ["d"], ["e"]),
+             helper.make_node("Add", ["one", "e"] if swapped else ["e", "one"], ["a"]),
+             helper.make_node("Mul", ["a", "x"] if swapped else ["x", "a"], ["m"]),
+             helper.make_node("Mul", ["half", "m"] if swapped else ["m", "half"], ["y"])]
+    case(name, "Erf", {"x": x}, nodes=nodes,
+         inits={"sqrt2": np.float32(1.4142135), "one": np.float32(1.0), "half": np.float32(0.5)})
+
+
+gelu_case("gelu_erf_pattern", spiked(4, 64))
+gelu_case("gelu_erf_pattern_swapped", rand(3, 33), swapped=True)
+
+
+# An embedding lookup whose token ids are an int64 GRAPH INPUT (decide's input_ids): lowered to ggml_get_rows over int32 ids the executor
+# converts per run (native, multi-threaded, and on the device for the GPU plugins). Negative ids wrap, as in ONNX.
+case("gather_input_ids_embedding", "Gather", {"table": spiked(11, 6), "ids": np.array([[0, 3, 10, -1, 5], [7, -11, 2, 2, 9]], np.int64)},
+     nodes=[helper.make_node("Gather", ["table", "ids"], ["y"], axis=0)])
+
+# A Transpose that moves a size-1 axis to the front, then a Slice: ggml calls such a permuted view contiguous (size-1 strides are not
+# checked) although its first stride is not the element size, and a strided view of it is invalid. The lowering must copy it.
+case("transpose_unit_axis_then_slice", "Slice", {"x": spiked(3, 1, 4)}, nodes=[
+    helper.make_node("Transpose", ["x"], ["t"], perm=[0, 2, 1]),
+    helper.make_node("Slice", ["t", "starts", "ends", "axes"], ["y"])],
+    inits={"starts": ax(1), "ends": ax(3), "axes": ax(1)})
+
 print(len(os.listdir(OUT)) // 2, "cases in", os.path.normpath(OUT))

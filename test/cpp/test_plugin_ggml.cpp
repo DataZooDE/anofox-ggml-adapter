@@ -192,3 +192,25 @@ TEST_CASE("plugin_ggml: an input the graph does not declare, or a missing one, i
 		REQUIRE(e.detail.find("'extra'") != std::string::npos);
 	}
 }
+
+TEST_CASE("plugin_ggml: a float32 initializer may be supplied as float16 (the host's mapped 16-bit checkpoint, upcast on upload)", "[adapter][plugin]") {
+	// The host passed float16 checkpoints only after upcasting them to a float32 copy it kept for the session (twice the checkpoint in
+	// host memory). A float32 initializer now takes the 16-bit data as it is.
+	Fixture f;
+	std::vector<uint16_t> w16;
+	for (float v : f.W) {
+		w16.push_back(FloatToHalf(v)); // 0.25 * i - 1: exact in float16
+	}
+	auto params = f.Params();
+	params.weights[0] = {"W", ANOFOX_GGML_DTYPE_FLOAT16, w16.data(), 12};
+	auto session = PluginSession::Open(PluginPath(), params);
+	const std::vector<float> x = {1, 0, 2, -1, 0.5f, 0.5f, 0, 3, -2, 1, 1, 1};
+	const std::vector<int64_t> ids = {9, 0, 4};
+	const std::vector<uint8_t> mask = {1, 0, 1};
+	const int64_t k = 2;
+	const auto out = session->Run(Inputs(x, ids, mask, k), {"s"});
+	const auto s = f.S(x, ids);
+	for (size_t i = 0; i < s.size(); i++) {
+		REQUIRE(std::fabs(out.at("s").data[i] - s[i]) <= 1e-5f);
+	}
+}

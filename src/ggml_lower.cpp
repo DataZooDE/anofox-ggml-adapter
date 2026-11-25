@@ -10,6 +10,7 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #if defined(__linux__)
 #include <sched.h>
@@ -107,80 +108,94 @@ bool SameNe(const ggml_tensor *t, const Ne4 &ne) {
 enum CustomOp : intptr_t { C_EQ, C_LT, C_LE, C_GT, C_GE, C_WHERE, C_ISNAN, C_ISINF_BOTH, C_ISINF_POS, C_ISINF_NEG,
 	               C_ERF, C_ROUND, C_RECIP, C_POW, C_MAX, C_MIN, C_MOD, C_CLIP_BOTH, C_CLIP_MIN, C_CLIP_MAX, C_SIGN, C_RELU, C_NEQ0, C_TRUNC, C_MODFLOOR, C_F16 };
 
+//! One elementwise op over a row: operand k is read at row_k[i * step_k] (step 0 broadcasts it along the row). Each op is its own instantiation
+//! of the loop, so the switch runs once per row, not per element, and the all-contiguous case (every step 1) vectorises.
+template <class F>
+inline void ElementwiseRow(float *out, int64_t n, const float *a, int64_t sa, const float *b, int64_t sb, const float *c, int64_t sc, F f) {
+	if (sa == 1 && (sb == 1 || !b) && (sc == 1 || !c)) {
+		for (int64_t i = 0; i < n; i++) {
+			out[i] = f(a[i], b ? b[i] : 0.0f, c ? c[i] : 0.0f);
+		}
+		return;
+	}
+	for (int64_t i = 0; i < n; i++) {
+		out[i] = f(a[i * sa], b ? b[i * sb] : 0.0f, c ? c[i * sc] : 0.0f);
+	}
+}
+
 void ElementwiseKernel(ggml_tensor *dst, int ith, int nth, void *userdata) {
 	const auto op = static_cast<CustomOp>(reinterpret_cast<intptr_t>(userdata));
 	const ggml_tensor *s0 = dst->src[0], *s1 = dst->src[1], *s2 = dst->src[2];
-	auto at = [&](const ggml_tensor *t, int64_t i0, int64_t i1, int64_t i2, int64_t i3) {
-		const char *p = static_cast<const char *>(t->data) + (t->ne[0] == 1 ? 0 : i0 * t->nb[0]) +
-		                (t->ne[1] == 1 ? 0 : i1 * t->nb[1]) + (t->ne[2] == 1 ? 0 : i2 * t->nb[2]) +
-		                (t->ne[3] == 1 ? 0 : i3 * t->nb[3]);
-		return *reinterpret_cast<const float *>(p);
+	// the start of row (i1, i2, i3) of an operand (a broadcast dimension stays at 0) and its element step along ne0 (Dim0Contiguous operands)
+	auto row_of = [](const ggml_tensor *t, int64_t i1, int64_t i2, int64_t i3, int64_t &step) -> const float * {
+		if (!t) {
+			step = 0;
+			return nullptr;
+		}
+		step = t->ne[0] == 1 ? 0 : 1;
+		return reinterpret_cast<const float *>(static_cast<const char *>(t->data) + (t->ne[1] == 1 ? 0 : i1 * t->nb[1]) +
+		                                       (t->ne[2] == 1 ? 0 : i2 * t->nb[2]) + (t->ne[3] == 1 ? 0 : i3 * t->nb[3]));
 	};
 	// Rows are independent: thread `ith` of `nth` takes every nth row.
-	const int64_t rows = dst->ne[1] * dst->ne[2] * dst->ne[3];
+	const int64_t rows = dst->ne[1] * dst->ne[2] * dst->ne[3], n = dst->ne[0];
 	for (int64_t row_index = ith; row_index < rows; row_index += nth) {
-		{
-			const int64_t i1 = row_index % dst->ne[1], i2 = (row_index / dst->ne[1]) % dst->ne[2], i3 = row_index / (dst->ne[1] * dst->ne[2]);
-			{
-				float *row = reinterpret_cast<float *>(static_cast<char *>(dst->data) + i3 * dst->nb[3] + i2 * dst->nb[2] + i1 * dst->nb[1]);
-				for (int64_t i0 = 0; i0 < dst->ne[0]; i0++) {
-					const float a = at(s0, i0, i1, i2, i3);
-					float r = 0.0f;
-					switch (op) {
-					case C_EQ: r = a == at(s1, i0, i1, i2, i3); break;
-					case C_LT: r = a < at(s1, i0, i1, i2, i3); break;
-					case C_LE: r = a <= at(s1, i0, i1, i2, i3); break;
-					case C_GT: r = a > at(s1, i0, i1, i2, i3); break;
-					case C_GE: r = a >= at(s1, i0, i1, i2, i3); break;
-					case C_WHERE: r = a != 0.0f ? at(s1, i0, i1, i2, i3) : at(s2, i0, i1, i2, i3); break;
-					case C_ISNAN: r = std::isnan(a); break;
-					case C_ISINF_BOTH: r = std::isinf(a); break;
-					case C_ISINF_POS: r = std::isinf(a) && a > 0; break;
-					case C_ISINF_NEG: r = std::isinf(a) && a < 0; break;
-					case C_SIGN: r = std::isnan(a) ? a : static_cast<float>((a > 0) - (a < 0)); break; // ggml_sgn turns NaN into 0
-					case C_TRUNC: r = std::trunc(a) + 0.0f; break; /* +0.0f: an integer has no -0 */ // Cast float -> int: toward zero; the integer lives on as an exact float
-					case C_F16: r = RoundToHalf(a); break; // Cast to FLOAT16: rounded to half precision, carried as float32
-					case C_NEQ0: r = a != 0.0f; break; // Cast to bool: NaN is true, like ORT
-					case C_RELU: r = a < 0.0f ? 0.0f : a; break; // NaN passes (ggml_relu maps it to 0)
-					case C_ERF: r = std::erf(a); break;
-					case C_ROUND: r = std::nearbyint(a); break; // ONNX Round is half to even
-					case C_RECIP: r = 1.0f / a; break;
-					case C_POW: r = std::pow(a, at(s1, i0, i1, i2, i3)); break;
-					case C_MAX:
-					case C_MIN: {
-						const float b = at(s1, i0, i1, i2, i3);
-						r = (std::isnan(a) || std::isnan(b)) ? std::nanf("") : (op == C_MAX ? std::max(a, b) : std::min(a, b));
-						break;
-					}
-					case C_MODFLOOR: { // integer Mod with fmod=0: the result takes the sign of the divisor
-						const float b = at(s1, i0, i1, i2, i3);
-						float m = std::fmod(a, b);
-						if (m != 0.0f && ((m < 0.0f) != (b < 0.0f))) {
-							m += b;
-						}
-						r = m + 0.0f;
-						break;
-					}
-					case C_MOD: r = std::fmod(a, at(s1, i0, i1, i2, i3)); break;
-					case C_CLIP_BOTH:
-					case C_CLIP_MIN:
-					case C_CLIP_MAX: {
-						// NaN passes through (both comparisons are false); a missing bound is +-FLT_MAX like ORT, so it also clamps +-inf
-						const float lo = op == C_CLIP_MAX ? -FLT_MAX : at(s1, i0, i1, i2, i3);
-						const float hi = op == C_CLIP_MIN ? FLT_MAX : at(op == C_CLIP_MAX ? s1 : s2, i0, i1, i2, i3);
-						r = a;
-						if (r < lo) {
-							r = lo;
-						}
-						if (r > hi) {
-							r = hi; // min(max(x, lo), hi): with lo > hi the result is hi, like ORT
-						}
-						break;
-					}
-					}
-					row[i0] = r;
+		const int64_t i1 = row_index % dst->ne[1], i2 = (row_index / dst->ne[1]) % dst->ne[2], i3 = row_index / (dst->ne[1] * dst->ne[2]);
+		float *out = reinterpret_cast<float *>(static_cast<char *>(dst->data) + i3 * dst->nb[3] + i2 * dst->nb[2] + i1 * dst->nb[1]);
+		int64_t sa, sb, sc;
+		const float *a = row_of(s0, i1, i2, i3, sa), *b = row_of(s1, i1, i2, i3, sb), *c = row_of(s2, i1, i2, i3, sc);
+		auto run = [&](auto f) { ElementwiseRow(out, n, a, sa, b, sb, c, sc, f); };
+		switch (op) {
+		case C_EQ: run([](float x, float y, float) { return static_cast<float>(x == y); }); break;
+		case C_LT: run([](float x, float y, float) { return static_cast<float>(x < y); }); break;
+		case C_LE: run([](float x, float y, float) { return static_cast<float>(x <= y); }); break;
+		case C_GT: run([](float x, float y, float) { return static_cast<float>(x > y); }); break;
+		case C_GE: run([](float x, float y, float) { return static_cast<float>(x >= y); }); break;
+		case C_WHERE: run([](float x, float y, float z) { return x != 0.0f ? y : z; }); break;
+		case C_ISNAN: run([](float x, float, float) { return static_cast<float>(std::isnan(x)); }); break;
+		case C_ISINF_BOTH: run([](float x, float, float) { return static_cast<float>(std::isinf(x)); }); break;
+		case C_ISINF_POS: run([](float x, float, float) { return static_cast<float>(std::isinf(x) && x > 0); }); break;
+		case C_ISINF_NEG: run([](float x, float, float) { return static_cast<float>(std::isinf(x) && x < 0); }); break;
+		case C_SIGN: run([](float x, float, float) { return std::isnan(x) ? x : static_cast<float>((x > 0) - (x < 0)); }); break; // ggml_sgn turns NaN into 0
+		case C_TRUNC: run([](float x, float, float) { return std::trunc(x) + 0.0f; }); break; // +0.0f: an integer has no -0 (Cast float -> int, toward zero)
+		case C_F16: run([](float x, float, float) { return RoundToHalf(x); }); break; // Cast to FLOAT16: rounded to half precision, carried as float32
+		case C_NEQ0: run([](float x, float, float) { return static_cast<float>(x != 0.0f); }); break; // Cast to bool: NaN is true, like ORT
+		case C_RELU: run([](float x, float, float) { return x < 0.0f ? 0.0f : x; }); break; // NaN passes (ggml_relu maps it to 0)
+		case C_ERF: run([](float x, float, float) { return std::erf(x); }); break;
+		case C_ROUND: run([](float x, float, float) { return std::nearbyint(x); }); break; // ONNX Round is half to even
+		case C_RECIP: run([](float x, float, float) { return 1.0f / x; }); break;
+		case C_POW: run([](float x, float y, float) { return std::pow(x, y); }); break;
+		case C_MAX: run([](float x, float y, float) { return (std::isnan(x) || std::isnan(y)) ? std::nanf("") : std::max(x, y); }); break;
+		case C_MIN: run([](float x, float y, float) { return (std::isnan(x) || std::isnan(y)) ? std::nanf("") : std::min(x, y); }); break;
+		case C_MODFLOOR: // integer Mod with fmod=0: the result takes the sign of the divisor
+			run([](float x, float y, float) {
+				float m = std::fmod(x, y);
+				if (m != 0.0f && ((m < 0.0f) != (y < 0.0f))) {
+					m += y;
 				}
-			}
+				return m + 0.0f;
+			});
+			break;
+		case C_MOD: run([](float x, float y, float) { return std::fmod(x, y); }); break;
+		// Clip: NaN passes through (both comparisons are false); a missing bound is +-FLT_MAX like ORT, so it also clamps +-inf;
+		// min(max(x, lo), hi): with lo > hi the result is hi, like ORT
+		case C_CLIP_BOTH:
+			run([](float x, float lo, float hi) {
+				float r = x < lo ? lo : x;
+				return r > hi ? hi : r;
+			});
+			break;
+		case C_CLIP_MIN: // hi = FLT_MAX
+			run([](float x, float lo, float) {
+				float r = x < lo ? lo : x;
+				return r > FLT_MAX ? FLT_MAX : r;
+			});
+			break;
+		case C_CLIP_MAX: // lo = -FLT_MAX
+			run([](float x, float hi, float) {
+				float r = x < -FLT_MAX ? -FLT_MAX : x;
+				return r > hi ? hi : r;
+			});
+			break;
 		}
 	}
 }
@@ -772,7 +787,11 @@ struct Lowering {
 		for (int64_t j = 0; j < r; j++) {
 			axis[r - 1 - perm[j]] = static_cast<int>(r - 1 - j);
 		}
-		ggml_tensor *copy = ggml_cont(ctx, ggml_permute(ctx, x, axis[0], axis[1], axis[2], axis[3]));
+		ggml_tensor *view = ggml_permute(ctx, x, axis[0], axis[1], axis[2], axis[3]);
+		// A permutation that undoes a view's needs no copy. ggml_is_contiguous skips size-1 dimensions, so a view whose first dimension is a
+		// moved size-1 axis passes it with a first stride other than the element size, which a later strided view cannot take: copied.
+		const bool in_order = ggml_is_contiguous(view) && view->nb[0] == ggml_type_size(view->type);
+		ggml_tensor *copy = in_order ? view : ggml_cont(ctx, view);
 		// Remember a swap of the last two dimensions (a weight's Transpose, attention's K^T): MatMul wants the operand in exactly the layout
 		// the transpose started from, so it can read the original instead of transposing the copy back.
 		bool swaps_last_two = r >= 2;
@@ -1335,12 +1354,21 @@ bool IsHost(const ShapeValue &v) {
 //! the context outlives everything that points into it.
 struct Compiled {
 	std::string signature;
+	uint64_t id = 0; // unique for the process (an address can be reused after a graph is evicted; this cannot)
 	ggml_context_ptr ctx;
 	ggml_cgraph *g = nullptr;
 	ggml_backend_buffer_ptr external_marker;
 	std::deque<FlatPlan> flat_plans;
 	std::deque<DoublePlan> double_plans;
 	std::deque<std::vector<int32_t>> index_storage;
+	//! Token ids a graph input carries into an embedding lookup (ggml_get_rows): converted from the call's floats into `ids` before every run,
+	//! negative ids wrapped and out-of-range ones refused (the table has `rows` rows).
+	struct IdInput {
+		std::string input, node;
+		std::vector<int32_t> *ids;
+		int64_t rows;
+	};
+	std::vector<IdInput> id_inputs;
 	std::vector<std::vector<float>> initializer_floats;
 	std::deque<std::vector<float>> folded;
 	std::vector<ggml_tensor *> node_outs;
@@ -1352,7 +1380,6 @@ struct Compiled {
 	std::vector<std::pair<std::string, ggml_tensor *>> outputs;
 	std::map<std::string, Shape> output_shapes;
 	HostTensors host_outputs; // outputs the host folded (integers, bool masks, constants): identical on every run of this signature
-	ggml_gallocr_ptr alloc;   // the activation arena, kept across runs (the plain CPU path)
 	ggml_backend_sched_ptr sched; // the scheduler path (a device, or "cpu-sched"): owns the activation buffers instead
 	bool sched_ready = false;     // split and allocated once (see ExecuteCompiled)
 	//! Device mode: a leaf is an ordinary tensor the scheduler allocates in device memory (a GPU kernel cannot read a host pointer), uploaded at every run.
@@ -1457,6 +1484,8 @@ std::string SignatureOf(const ::anofox::onnxread::Graph &graph, const HostTensor
 std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, const HostTensors &inputs, const GgmlRunOptions &options,
                                        const WeightLookup &weights, const WeightProvider &provider) {
 	auto compiled = std::make_unique<Compiled>();
+	static std::atomic<uint64_t> next_compiled_id {1};
+	compiled->id = next_compiled_id++;
 	compiled->device_mode = static_cast<bool>(provider);
 	compiled->signature = SignatureOf(graph, inputs, options);
 	PhaseClock clock;
@@ -1617,7 +1646,9 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 				throw std::runtime_error("ggml lowering: weight '" + t.name + "' has " + std::to_string(external.count) + " values for a shape of " +
 				                         std::to_string(count));
 			}
-			if (external.onnx_type != t.data_type) {
+			// a device upload upcasts 16-bit data, so a float32 initializer may take a host's 16-bit checkpoint as it is
+			const bool device_upcast = provider && t.data_type == 1 && (external.onnx_type == 10 || external.onnx_type == 16);
+			if (external.onnx_type != t.data_type && !device_upcast) {
 				throw std::runtime_error("ggml lowering: weight '" + t.name + "' is declared as ONNX type " + std::to_string(t.data_type) + " but was supplied as type " +
 				                         std::to_string(external.onnx_type));
 			}
@@ -1633,6 +1664,22 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 				                         " (bf16/fp16); only a device executor upcasts those on upload (the CPU session upcasts while injecting)");
 			}
 			leaf(t.name, Shape(t.dims.begin(), t.dims.end()), external.data);
+			return;
+		}
+		if (provider && t.data_type == 1 && count > 1 && (!t.raw.empty() ? t.raw.size() >= count * 4 : t.floats.size() >= count)) {
+			// A device: an inline float32 weight (a registered full graph carries all of them) becomes a persistent device weight, uploaded
+			// once for the executor. As a per-run upload leaf it was copied to the device again on every run: the whole model per call.
+			Node pseudo;
+			pseudo.name = t.name;
+			pseudo.op_type = "<weight>";
+			std::vector<float> aligned;
+			const float *host = !t.raw.empty() ? reinterpret_cast<const float *>(t.raw.data()) : t.floats.data();
+			if (!t.raw.empty() && reinterpret_cast<uintptr_t>(t.raw.data()) % alignof(float) != 0) {
+				aligned.resize(count);
+				std::memcpy(aligned.data(), t.raw.data(), count * 4);
+				host = aligned.data();
+			}
+			low.tensors[t.name] = provider(t.name, ToStorage(pseudo, Shape(t.dims.begin(), t.dims.end())), host, 1);
 			return;
 		}
 		if (t.data_type == 1 && !t.raw.empty() && t.raw.size() >= count * 4 && reinterpret_cast<uintptr_t>(t.raw.data()) % alignof(float) == 0) {
@@ -1702,12 +1749,12 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 		Fail(n, "operand '" + name + "' is not a float tensor ggml holds");
 	};
 
-	// Scaled-dot-product attention, fused (CPU path only). The exports spell attention as
+	// Scaled-dot-product attention, fused on the CPU backend (see cpu_backend below for why not on a GPU). The exports spell attention as
 	//   MatMul(q, kT) [* scale] [+ Where(keep, 0, -max)] -> Softmax(last axis) [-> Cast(float)...] -> MatMul(., v)
 	// and the unfused lowering materialises the [B, H, S, S] scores and passes over them four times. At the final MatMul the pattern is
 	// traced back from the names; when it matches, one ggml_flash_attn_ext replaces it and the unfused chain (already lowered) is dead, so
 	// it is never computed. Only a mask whose values are 0 or below the float16 range is fused (ggml's mask is float16: a real-valued
-	// bias would be rounded). A GPU device keeps the unfused lowering its plugins were verified with.
+	// bias would be rounded).
 	std::unordered_map<std::string, const ::anofox::onnxread::Node *> producer;
 	for (const auto &nd : graph.nodes) {
 		for (const auto &o : nd.outputs) {
@@ -1716,7 +1763,9 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 			}
 		}
 	}
-	// "cpu" and "cpu-sched" (the device code path on the CPU backend) run on ggml's CPU backend; "gpu"/"gpu:N" keep the unfused lowering
+	// "cpu" and "cpu-sched" (the device code path on the CPU backend) run on ggml's CPU backend, whose flash attention accumulates in
+	// float32. A GPU keeps the unfused attention: ROCm's flash-attention kernels moved decide's probabilities by up to 5e-3 against the
+	// CPU (the GPU bar is 1e-3; unfused 5e-5), measured on gfx1150.
 	const bool cpu_backend = options.device == "cpu" || options.device == "cpu-sched";
 	std::unordered_map<std::string, ggml_tensor *> f16_masks; // one float16 copy per (mask, query length), shared by the layers that add it
 	auto fuse_attention = [&](const ::anofox::onnxread::Node &n) -> ggml_tensor * {
@@ -1848,7 +1897,12 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 		if (SQ != S) {
 			q = ggml_pad(c, low.Contiguous(q), 0, static_cast<int>(SQ - S), 0, 0);                  // ne [D, SQ, H, B], zero rows at the end
 		}
-		ggml_tensor *k = rows_contiguous(ggml_transpose(c, tensor_of(n, ktn)));                     // kT [SK, D, H, B] -> [D, SK, H, B]
+		ggml_tensor *kt = tensor_of(n, ktn);
+		const auto k_origin = low.transposed_from.find(kt); // kT is usually the graph's Transpose(K) copy: read K itself instead
+		ggml_tensor *k = k_origin != low.transposed_from.end() && k_origin->second->nb[0] == ggml_type_size(k_origin->second->type) &&
+		                         SameNe(k_origin->second, {D, SK, H, B})
+		                     ? k_origin->second
+		                     : rows_contiguous(ggml_transpose(c, kt)); // kT [SK, D, H, B] -> [D, SK, H, B]
 		ggml_tensor *v = rows_contiguous(tensor_of(n, vn));                                          // ne [Dv, SK, H, B]
 		ggml_tensor *m16 = nullptr;
 		if (!mask.empty()) {
@@ -1862,12 +1916,15 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 				ggml_tensor *m = low.Contiguous(tensor_of(n, mask));
 				m = ggml_reshape_4d(c, m, SK, ms[2], ms[1], ms[0]);
 				if (ms[2] != S) {
-					// one mask row for every query: repeated to all SQ rows (the cached copy is the same for any S that pads to SQ)
-					m = ggml_repeat(c, m, ggml_new_tensor_4d(c, GGML_TYPE_F32, SK, SQ, ms[1], ms[0]));
-				} else if (SQ != S) {
-					m = ggml_pad(c, m, 0, static_cast<int>(SQ - S), 0, 0); // a mask row per query: the padding rows see every key (dropped)
+					// one mask row for every query: cast first, then repeated to all SQ rows in float16 (no float32 [SK, SQ] intermediate;
+					// the cached copy is the same for any S that pads to SQ)
+					m16 = ggml_repeat(c, ggml_cast(c, m, GGML_TYPE_F16), ggml_new_tensor_4d(c, GGML_TYPE_F16, SK, SQ, ms[1], ms[0]));
+				} else {
+					if (SQ != S) {
+						m = ggml_pad(c, m, 0, static_cast<int>(SQ - S), 0, 0); // a mask row per query: padding rows see every key (dropped)
+					}
+					m16 = ggml_cast(c, m, GGML_TYPE_F16);
 				}
-				m16 = ggml_cast(c, m, GGML_TYPE_F16);
 				f16_masks[key] = m16;
 			}
 		}
@@ -1876,6 +1933,54 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 			fa = ggml_view_4d(c, fa, fa->ne[0], fa->ne[1], S, fa->ne[3], fa->nb[1], fa->nb[2], fa->nb[3], 0); // [Dv, H, SQ, B] -> the first S rows
 		}
 		return ggml_permute(c, fa, 0, 2, 1, 3); // [Dv, H, S, B] -> the MatMul's [Dv, S, H, B]
+	};
+
+	// Exact GELU, as the encoder exports spell it: Mul(Mul(x, Add(Erf(Div(x, sqrt 2)), 1)), 0.5) (operands in either order). Three of those
+	// five ops are CPU-only custom kernels over the MLP activations (a device round trip per layer on a GPU); ggml_gelu_erf is one native
+	// pass. It computes erf(x * 0.70710678) for erf(x / 1.4142135): within an ulp of the argument (accepted, held to Erf's tolerance).
+	auto fuse_gelu = [&](const ::anofox::onnxread::Node &n) -> ggml_tensor * {
+		auto made_by = [&](const std::string &t) -> const ::anofox::onnxread::Node * {
+			const auto it = producer.find(t);
+			return it == producer.end() ? nullptr : it->second;
+		};
+		auto scalar = [&](const std::string &t, double want, double tol) {
+			const auto it = low.shapes.find(t);
+			return it != low.shapes.end() && it->second.known && it->second.dtype == ShapeDtype::F32 && it->second.floats.size() == 1 &&
+			       std::fabs(it->second.floats[0] - want) <= tol;
+		};
+		// the operand of binary node `p` that is not the scalar constant `want`, or "" when neither is
+		auto other_than = [&](const ::anofox::onnxread::Node *p, const char *op, double want, double tol) -> std::string {
+			if (!p || p->op_type != op || p->inputs.size() != 2) {
+				return "";
+			}
+			return scalar(p->inputs[1], want, tol) ? p->inputs[0] : scalar(p->inputs[0], want, tol) ? p->inputs[1] : "";
+		};
+		if (n.inputs.size() != 2) {
+			return nullptr;
+		}
+		const std::string m = other_than(&n, "Mul", 0.5, 0.0); // ... * 0.5
+		const auto *mul = made_by(m);
+		if (m.empty() || !mul || mul->op_type != "Mul" || mul->inputs.size() != 2) {
+			return nullptr;
+		}
+		for (int side = 0; side < 2; side++) { // x * (erf(x / sqrt 2) + 1), either order
+			const std::string &x = mul->inputs[side], &a = mul->inputs[1 - side];
+			const std::string e = other_than(made_by(a), "Add", 1.0, 0.0);
+			const auto *erf = made_by(e);
+			if (e.empty() || !erf || erf->op_type != "Erf" || erf->inputs.size() != 1) {
+				continue;
+			}
+			const auto *div = made_by(erf->inputs[0]);
+			if (!div || div->op_type != "Div" || div->inputs.size() != 2 || div->inputs[0] != x || !scalar(div->inputs[1], std::sqrt(2.0), 1e-6)) {
+				continue;
+			}
+			const auto xv = low.shapes.find(x);
+			if (xv == low.shapes.end() || xv->second.known || xv->second.dtype != ShapeDtype::F32 || xv->second.shape != low.shapes.at(n.outputs.at(0)).shape) {
+				return nullptr;
+			}
+			return ggml_gelu_erf(ctx.get(), low.Contiguous(tensor_of(n, x)));
+		}
+		return nullptr;
 	};
 
 	for (const auto &n : graph.nodes) {
@@ -2060,6 +2165,8 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 			      : op == "Exp"  ? ggml_exp(ctx.get(), x)
 			      : op == "Log"  ? ggml_log(ctx.get(), x)
 			                     : ggml_tanh(ctx.get(), x);
+		} else if (op == "Mul" && (out = fuse_gelu(n)) != nullptr) {
+			// the fused exact GELU (above)
 		} else if (op == "Add" || op == "Sub" || op == "Mul" || op == "Div") {
 			// Integers computed from float data live as floats; ONNX integer Div truncates toward zero.
 			const bool integer_div = op == "Div" && low.shapes.at(n.outputs.at(0)).dtype == ShapeDtype::I64;
@@ -2271,7 +2378,17 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 			const int64_t axis = normalised_axis(n.Attr("axis") ? n.Attr("axis")->i : 0, sh(0).size());
 			const auto idx_value = low.shapes.find(n.inputs.at(1));
 			const bool idx_known = idx_value != low.shapes.end() && idx_value->second.known && idx_value->second.dtype == ShapeDtype::I64;
-			if (!idx_known) {
+			if (!idx_known && axis == 0 && sh(0).size() == 2 && compiled->input_leaves.count(n.inputs.at(1)) != 0) {
+				// An embedding lookup with token ids straight from a graph input: ggml_get_rows over int32 ids the executor converts (and
+				// range-checks) per run. Native and multi-threaded, and on a device it stays there (a host kernel made the scheduler copy the
+				// whole table to the host on every run).
+				const int64_t count = compiled->input_leaves.at(n.inputs.at(1)).second;
+				index_storage.emplace_back(static_cast<size_t>(count), 0);
+				ggml_tensor *ids = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, count);
+				bind_external(ids, index_storage.back().data());
+				compiled->id_inputs.push_back({n.inputs.at(1), n.name, &index_storage.back(), sh(0)[0]});
+				out = low.Reshape(n, ggml_get_rows(ctx.get(), low.Dim0Contiguous(in(0)), ids), out_shape);
+			} else if (!idx_known) {
 				// indices computed from float data: held as exact floats, gathered by a host kernel
 				out = low.GatherDynamic(n, in(0), sh(0), in(1), axis, out_shape);
 			} else if (sh(0).size() > 4) {
@@ -2587,8 +2704,19 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 //! Run a compiled graph: point the input leaves at this call's buffers, allocate the activation arena (kept for the next run), compute, read the
 //! outputs. The weights are read where the caller keeps them; nothing is copied in.
 //! The backends one executor computes on.
+//! The plain CPU path's activation arena, one per executor: sized for the largest cached graph rather than one arena per cached shape.
+//! ggml's allocator replans only when a graph's node count or sizes change, so a different graph of the same counts would run on the
+//! previous graph's plan: the arena remembers which graph it planned for and replans on every switch.
+struct SharedArena {
+	ggml_gallocr_ptr alloc;
+	uint64_t planned_for = 0;
+};
+
 struct ExecutorRuntime {
 	ggml_backend_t cpu = nullptr;                    // always present; runs the custom kernels and, for device "cpu", everything
+	SharedArena *arena = nullptr;                    // the executor's (see SharedArena)
+	std::string out_of_memory_remedy;                // the host's advice (GgmlExecutorConfig), appended to a device out-of-memory error
+	size_t *uploaded_bytes = nullptr;                // the executor's count of bytes copied to the device (UploadedBytes)
 	ggml_threadpool_t pool = nullptr;
 	int threads = 1;
 	std::vector<ggml_backend_t> sched_backends;      // scheduler path: the device first, the CPU last (empty = plain CPU path)
@@ -2642,6 +2770,21 @@ HostTensors ExecuteCompiled(Compiled &c, const ExecutorRuntime &rt, const HostTe
 	}
 	for (ggml_tensor *view : c.input_views) {
 		view->data = static_cast<char *>(view->view_src->data) + view->view_offs; // follow the re-pointed leaf
+	}
+	for (const auto &id : c.id_inputs) { // token ids for the embedding lookups, checked before anything runs
+		const std::vector<float> &raw = inputs.at(id.input).data;
+		for (size_t i = 0; i < raw.size(); i++) {
+			const float r = raw[i];
+			int64_t v = std::isfinite(r) ? static_cast<int64_t>(r) : id.rows;
+			v += v < 0 ? id.rows : 0;
+			if (v < 0 || v >= id.rows || static_cast<float>(static_cast<int64_t>(r)) != r) {
+				char shown[32];
+				std::snprintf(shown, sizeof(shown), "%.9g", static_cast<double>(r)); // NaN/inf/fractions print as they are
+				throw std::runtime_error("ggml lowering: Gather '" + id.node + "': index " + shown + " (element " +
+				                         std::to_string(i) + " of input '" + id.input + "') is out of range for " + std::to_string(id.rows) + " rows");
+			}
+			(*id.ids)[i] = static_cast<int32_t>(v);
+		}
 	}
 	c.run_error.failed = false;
 	c.run_error.message.clear();
@@ -2736,7 +2879,9 @@ HostTensors ExecuteCompiled(Compiled &c, const ExecutorRuntime &rt, const HostTe
 			}
 			if (!ggml_backend_sched_alloc_graph(c.sched.get(), c.g)) {
 				c.sched.reset();
-				throw std::runtime_error("ggml lowering: could not allocate the device compute buffers");
+				// the activations of this input shape do not fit next to the weights: worded so the host recognises it as out of memory
+				throw std::runtime_error("ggml lowering: out of device memory allocating the compute buffers for this input shape. " +
+				                         rt.out_of_memory_remedy);
 			}
 			c.sched_ready = true;
 			clock.Lap("sched alloc");
@@ -2747,6 +2892,9 @@ HostTensors ExecuteCompiled(Compiled &c, const ExecutorRuntime &rt, const HostTe
 			}
 			const void *host = u.input_name.empty() ? u.host : inputs.at(u.input_name).data.data();
 			ggml_backend_tensor_set(u.tensor, host, 0, ggml_nbytes(u.tensor));
+			if (rt.uploaded_bytes) {
+				*rt.uploaded_bytes += ggml_nbytes(u.tensor);
+			}
 		}
 		clock.Lap("upload");
 		ggml_status status;
@@ -2763,10 +2911,27 @@ HostTensors ExecuteCompiled(Compiled &c, const ExecutorRuntime &rt, const HostTe
 		}
 		return ReadOutputs(c);
 	}
-	if (!c.alloc) {
-		c.alloc.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend)));
+	SharedArena &arena = *rt.arena;
+	if (!arena.alloc) {
+		arena.alloc.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend)));
 	}
-	if (!c.alloc || !ggml_gallocr_alloc_graph(c.alloc.get(), c.g)) {
+	if (arena.alloc && arena.planned_for != c.id) {
+		arena.planned_for = 0;
+		// The allocator skips a tensor that already has data. This graph's intermediates still point where the arena put them last time
+		// (into a buffer it may have freed since, when a larger graph grew it): forget every placement the arena made, so it places them
+		// all again. Leaves bound to the caller's memory (weights, inputs, constants) carry the external marker buffer and are kept.
+		for (ggml_tensor *t = ggml_get_first_tensor(c.ctx.get()); t; t = ggml_get_next_tensor(c.ctx.get(), t)) {
+			if (t->buffer && t->buffer != c.external_marker.get()) {
+				t->data = nullptr;
+				t->buffer = nullptr;
+			}
+		}
+		if (!ggml_gallocr_reserve(arena.alloc.get(), c.g)) { // plans this graph (the buffer only ever grows: the largest graph sizes it)
+			throw std::runtime_error("ggml lowering: could not allocate the compute buffers");
+		}
+		arena.planned_for = c.id;
+	}
+	if (!arena.alloc || !ggml_gallocr_alloc_graph(arena.alloc.get(), c.g)) {
 		throw std::runtime_error("ggml lowering: could not allocate the compute buffers");
 	}
 	clock.Lap("gallocr alloc");
@@ -2809,6 +2974,8 @@ struct GgmlExecutor::Impl {
 	std::map<std::string, ggml_tensor *> weights_on_device;
 	std::list<std::unique_ptr<Compiled>> cache; // most recently used first
 	size_t compiles = 0;
+	SharedArena arena; // the plain CPU path's activations, shared by every cached graph
+	size_t uploaded_bytes = 0; // copied to the device so far (UploadedBytes)
 
 	Impl(const ::anofox::onnxread::Graph &graph_p, GgmlExecutorConfig config_p) : graph(graph_p), config(std::move(config_p)) {
 		try {
@@ -2850,6 +3017,9 @@ struct GgmlExecutor::Impl {
 			pool = ggml_threadpool_new(&params);
 		}
 		runtime.cpu = cpu.get();
+		runtime.arena = &arena;
+		runtime.out_of_memory_remedy = config.out_of_memory_remedy;
+		runtime.uploaded_bytes = &uploaded_bytes;
 		runtime.pool = pool;
 		runtime.threads = config.threads;
 		if (config.device == "cpu") {
@@ -2944,6 +3114,7 @@ struct GgmlExecutor::Impl {
 			}
 		}
 		weights_on_device[name] = t;
+		uploaded_bytes += ggml_nbytes(t);
 		return t;
 	}
 
@@ -3120,6 +3291,17 @@ size_t GgmlExecutor::PreloadWeights() {
 void GgmlExecutor::Trim() {
 	std::lock_guard<std::mutex> guard(impl_->mutex);
 	impl_->cache.clear();
+	impl_->arena = SharedArena {}; // and their activation memory
+}
+
+size_t GgmlExecutor::UploadedBytes() const {
+	std::lock_guard<std::mutex> guard(impl_->mutex);
+	return impl_->uploaded_bytes;
+}
+
+size_t GgmlExecutor::ActivationBytes() const {
+	std::lock_guard<std::mutex> guard(impl_->mutex);
+	return impl_->arena.alloc ? ggml_gallocr_get_buffer_size(impl_->arena.alloc.get(), 0) : 0;
 }
 
 size_t GgmlExecutor::CompileCount() const {

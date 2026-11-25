@@ -115,6 +115,11 @@ public:
 
 	//! Number of graphs compiled so far (a test hook: a repeated signature must not recompile).
 	size_t CompileCount() const;
+	//! Bytes of the CPU activation arena(s) this executor holds (a test and diagnostics hook): one arena serves every cached graph, sized
+	//! for the largest, instead of one per cached input shape.
+	size_t ActivationBytes() const;
+	//! Bytes this executor has copied to its device so far (weights, constants, inputs; 0 on the plain CPU path): a test and diagnostics hook.
+	size_t UploadedBytes() const;
 	//! Bytes of initializer copies the cached compiled graphs hold (inline weights the lowering had to decode; float32 ones are read in place).
 	size_t InitializerCopyBytes() const;
 

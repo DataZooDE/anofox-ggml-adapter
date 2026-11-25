@@ -461,3 +461,29 @@ TEST_CASE("shape_eval: the shape-feeding ops the real graph relies on", "[adapte
 	REQUIRE(r.values.at("vals").shape == std::vector<int64_t> {2, 4});
 	REQUIRE(r.values.at("idx").dtype == ShapeDtype::I64);
 }
+
+// A full exported model keeps its weights inline (a registered .onnx, up to GBs). The shape pass runs once per new input shape; it used to
+// decode every float initializer into a vector<double> (twice the model's bytes, and seconds) although nothing folds a tensor that large:
+// the lowering reads the weights in place. Above the known-elements cap an initializer stays unknown, like any oversized value.
+TEST_CASE("shape_eval: a large inline initializer is not decoded (its values stay unknown)", "[adapter][shape_eval]") {
+	Graph g;
+	::anofox::onnxread::Tensor w;
+	w.name = "w";
+	w.dims = {2048, 1024}; // 2M floats, above the 1M-element cap
+	w.data_type = 1;
+	w.raw.assign(static_cast<size_t>(2048 * 1024 * 4), '\0');
+	g.initializers.push_back(w);
+	::anofox::onnxread::Tensor small;
+	small.name = "s";
+	small.dims = {3};
+	small.data_type = 1;
+	const float sv[3] = {1.5f, -2.0f, 0.25f};
+	small.raw.assign(reinterpret_cast<const char *>(sv), sizeof(sv));
+	g.initializers.push_back(small);
+	const auto r = EvaluateShapes(g, ShapeEvalInput {});
+	REQUIRE(r.values.at("w").shape == std::vector<int64_t> {2048, 1024});
+	REQUIRE_FALSE(r.values.at("w").known);
+	REQUIRE(r.values.at("w").floats.empty());
+	REQUIRE(r.values.at("s").known); // small constants still fold
+	REQUIRE(r.values.at("s").floats == std::vector<double> {1.5, -2.0, 0.25});
+}

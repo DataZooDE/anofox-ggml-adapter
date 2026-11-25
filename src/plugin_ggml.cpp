@@ -170,7 +170,9 @@ void *PluginCreate(const AnofoxGgmlCreateParams *params, char *err, size_t err_l
 			if (w.rank >= 0 && (static_cast<size_t>(w.rank) != t.dims.size() || !std::equal(t.dims.begin(), t.dims.end(), w.shape))) {
 				throw std::runtime_error("the weight '" + t.name + "' was supplied with another shape than the graph declares");
 			}
-			if (w.dtype != t.data_type) {
+			// a 16-bit checkpoint may feed a float32 initializer: the host passes its mapped checkpoint, the upload upcasts it
+			const bool upcast = t.data_type == ANOFOX_GGML_DTYPE_FLOAT && (w.dtype == ANOFOX_GGML_DTYPE_FLOAT16 || w.dtype == ANOFOX_GGML_DTYPE_BFLOAT16);
+			if (w.dtype != t.data_type && !upcast) {
 				throw std::runtime_error("the weight '" + t.name + "' was supplied as ONNX type " + std::to_string(w.dtype) +
 				                         ", the graph declares type " + std::to_string(t.data_type));
 			}
@@ -242,7 +244,8 @@ const char *const *PluginGraphInputs(void *handle) {
 }
 
 bool IsMemoryError(const std::string &what) {
-	return what.find("out of memory") != std::string::npos || what.find("failed to allocate") != std::string::npos;
+	return what.find("out of memory") != std::string::npos || what.find("out of device memory") != std::string::npos ||
+	       what.find("failed to allocate") != std::string::npos;
 }
 
 AnofoxGgmlPluginStatus PluginRun(void *handle, const AnofoxGgmlTensorIn *inputs, size_t input_count, const char *const *outputs,
