@@ -1174,3 +1174,30 @@ TEST_CASE("ggml_executor: on a device, a float32 initializer takes 16-bit data a
 	inline_executor.Run(xin, GgmlRunOptions());
 	REQUIRE(inline_executor.UploadedBytes() - after_first == 2 * 4 * 256 * sizeof(float)); // later runs move only the input
 }
+
+TEST_CASE("ggml_executor: a graph planned before the shared arena grew runs on the new buffer, not the freed one", "[adapter][ggml][ggml_ops][arena]") {
+	// The allocator treats a tensor that has data as allocated: after a larger graph made the arena reallocate, a smaller graph's
+	// intermediates still pointed into the freed old buffer and computed there (heap-use-after-free in anofox-tabfm's cobatch test).
+	// Sizes above glibc's 128 KB mmap threshold: the old buffer is unmapped, so a stale pointer crashes instead of passing silently.
+	::anofox::onnxread::Graph g;
+	g.inputs = {"x"};
+	g.nodes = {MakeNode("Exp", {"x"}, "e"), MakeNode("Mul", {"e", "x"}, "m"), MakeNode("Add", {"m", "e"}, "y")};
+	g.outputs = {"y"};
+	auto input = [](int64_t rows) {
+		HostTensors in;
+		in["x"] = HostTensor {{rows, 256}, std::vector<float>(static_cast<size_t>(rows * 256), 0.5f)};
+		return in;
+	};
+	GgmlExecutorConfig config;
+	config.threads = 2;
+	config.cache_entries = 4;
+	GgmlExecutor executor(g, config);
+	const float want = std::exp(0.5f) * 0.5f + std::exp(0.5f);
+	for (int64_t rows : {256, 4096, 256, 8192, 256}) { // small, larger (the arena grows), small again, ...
+		INFO("rows " << rows);
+		const auto out = executor.Run(input(rows), GgmlRunOptions {});
+		REQUIRE(out.at("y").data.size() == static_cast<size_t>(rows * 256));
+		REQUIRE(std::fabs(out.at("y").data.front() - want) < 1e-5f);
+		REQUIRE(std::fabs(out.at("y").data.back() - want) < 1e-5f);
+	}
+}

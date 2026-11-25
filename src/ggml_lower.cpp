@@ -2917,6 +2917,15 @@ HostTensors ExecuteCompiled(Compiled &c, const ExecutorRuntime &rt, const HostTe
 	}
 	if (arena.alloc && arena.planned_for != c.id) {
 		arena.planned_for = 0;
+		// The allocator skips a tensor that already has data. This graph's intermediates still point where the arena put them last time
+		// (into a buffer it may have freed since, when a larger graph grew it): forget every placement the arena made, so it places them
+		// all again. Leaves bound to the caller's memory (weights, inputs, constants) carry the external marker buffer and are kept.
+		for (ggml_tensor *t = ggml_get_first_tensor(c.ctx.get()); t; t = ggml_get_next_tensor(c.ctx.get(), t)) {
+			if (t->buffer && t->buffer != c.external_marker.get()) {
+				t->data = nullptr;
+				t->buffer = nullptr;
+			}
+		}
 		if (!ggml_gallocr_reserve(arena.alloc.get(), c.g)) { // plans this graph (the buffer only ever grows: the largest graph sizes it)
 			throw std::runtime_error("ggml lowering: could not allocate the compute buffers");
 		}
