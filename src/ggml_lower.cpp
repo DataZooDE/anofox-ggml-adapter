@@ -772,7 +772,8 @@ struct Lowering {
 		for (int64_t j = 0; j < r; j++) {
 			axis[r - 1 - perm[j]] = static_cast<int>(r - 1 - j);
 		}
-		ggml_tensor *copy = ggml_cont(ctx, ggml_permute(ctx, x, axis[0], axis[1], axis[2], axis[3]));
+		ggml_tensor *view = ggml_permute(ctx, x, axis[0], axis[1], axis[2], axis[3]);
+		ggml_tensor *copy = ggml_is_contiguous(view) ? view : ggml_cont(ctx, view); // a permutation that undoes a view's needs no copy
 		// Remember a swap of the last two dimensions (a weight's Transpose, attention's K^T): MatMul wants the operand in exactly the layout
 		// the transpose started from, so it can read the original instead of transposing the copy back.
 		bool swaps_last_two = r >= 2;
@@ -1848,7 +1849,12 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 		if (SQ != S) {
 			q = ggml_pad(c, low.Contiguous(q), 0, static_cast<int>(SQ - S), 0, 0);                  // ne [D, SQ, H, B], zero rows at the end
 		}
-		ggml_tensor *k = rows_contiguous(ggml_transpose(c, tensor_of(n, ktn)));                     // kT [SK, D, H, B] -> [D, SK, H, B]
+		ggml_tensor *kt = tensor_of(n, ktn);
+		const auto k_origin = low.transposed_from.find(kt); // kT is usually the graph's Transpose(K) copy: read K itself instead
+		ggml_tensor *k = k_origin != low.transposed_from.end() && k_origin->second->nb[0] == ggml_type_size(k_origin->second->type) &&
+		                         SameNe(k_origin->second, {D, SK, H, B})
+		                     ? k_origin->second
+		                     : rows_contiguous(ggml_transpose(c, kt)); // kT [SK, D, H, B] -> [D, SK, H, B]
 		ggml_tensor *v = rows_contiguous(tensor_of(n, vn));                                          // ne [Dv, SK, H, B]
 		ggml_tensor *m16 = nullptr;
 		if (!mask.empty()) {
@@ -1862,12 +1868,15 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 				ggml_tensor *m = low.Contiguous(tensor_of(n, mask));
 				m = ggml_reshape_4d(c, m, SK, ms[2], ms[1], ms[0]);
 				if (ms[2] != S) {
-					// one mask row for every query: repeated to all SQ rows (the cached copy is the same for any S that pads to SQ)
-					m = ggml_repeat(c, m, ggml_new_tensor_4d(c, GGML_TYPE_F32, SK, SQ, ms[1], ms[0]));
-				} else if (SQ != S) {
-					m = ggml_pad(c, m, 0, static_cast<int>(SQ - S), 0, 0); // a mask row per query: the padding rows see every key (dropped)
+					// one mask row for every query: cast first, then repeated to all SQ rows in float16 (no float32 [SK, SQ] intermediate;
+					// the cached copy is the same for any S that pads to SQ)
+					m16 = ggml_repeat(c, ggml_cast(c, m, GGML_TYPE_F16), ggml_new_tensor_4d(c, GGML_TYPE_F16, SK, SQ, ms[1], ms[0]));
+				} else {
+					if (SQ != S) {
+						m = ggml_pad(c, m, 0, static_cast<int>(SQ - S), 0, 0); // a mask row per query: padding rows see every key (dropped)
+					}
+					m16 = ggml_cast(c, m, GGML_TYPE_F16);
 				}
-				m16 = ggml_cast(c, m, GGML_TYPE_F16);
 				f16_masks[key] = m16;
 			}
 		}

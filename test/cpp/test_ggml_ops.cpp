@@ -1023,3 +1023,23 @@ TEST_CASE("ggml_lowering: a fused attention row does not depend on how many quer
 		}
 	}
 }
+
+TEST_CASE("ggml_lowering: the fused attention copies no activations around it", "[adapter][ggml][ggml_ops][attention]") {
+	// K arrives as the graph's Transpose(K) copy, which the fusion transposes back; Q/V/K are contiguous graph inputs here, the scores are
+	// never materialised, and the output's layout is what the consumer wants. Each avoidable copy is a full [B, S, H*D] pass per layer.
+	for (const char *stem : {"sdpa_band_keypad_tiled", "sdpa_keypad_short_swapped", "sdpa_no_mask"}) {
+		INFO("case " << stem);
+		const std::string path = std::string("test/fixtures/ggml_ops/") + stem;
+		const Case c = ReadCase(path);
+		const auto graph = ReadGraph(path);
+		GgmlExecutorConfig config;
+		config.threads = 2;
+		GgmlExecutor executor(graph, config);
+		const auto ops = executor.GraphOpCounts(c.inputs, GgmlRunOptions {});
+		INFO("CONT nodes: " << (ops.count("CONT") ? ops.at("CONT") : 0));
+		REQUIRE(ops.count("FLASH_ATTN_EXT") == 1);
+		// one copy remains: the graph output itself (the fused result is a permuted view; the caller gets it contiguous)
+		REQUIRE(ops.count("CONT") == 1);
+		REQUIRE(ops.at("CONT") == 1);
+	}
+}
