@@ -27,6 +27,21 @@
   uniform average. `GgmlExecutor::GraphOpCounts()` reports the ops of a compiled graph (a test hook).
   A query row's result does not depend on how many rows share the batch: fewer than 64 query rows are padded to the
   tiled kernel's 64 (ggml picks its flash-attention kernel by row count, and the kernels sum in different orders).
+- The exact-GELU pattern (`Mul(Mul(x, Add(Erf(Div(x, sqrt 2)), 1)), 0.5)`) lowers to one `ggml_gelu_erf` on the CPU and on devices
+  (five passes, three of them CPU-only kernels, before). It computes `erf(x * 0.70710678)`: within an ulp of the graph's argument,
+  held to Erf's tolerance by ONNX Runtime goldens.
+- An embedding lookup whose token ids come straight from a graph input is `ggml_get_rows` over int32 ids the executor converts per
+  run (multi-threaded, and on a GPU no longer a copy of the whole table to the host every run). Negative ids wrap; NaN, fractional
+  and out-of-range ids are refused with the node, element and bound named (the host kernel returned NaN).
+- One CPU activation arena per executor, sized for the largest cached graph, instead of one per cached input shape; it replans on
+  every switch of graph. `GgmlExecutor::ActivationBytes()` and `UploadedBytes()` as test hooks.
+- No activation copies around the fused attention (K is read from the tensor the graph's Transpose copied; a permutation that undoes
+  a view returns the view); a key-padding mask is cast to float16 before it is repeated.
+- The elementwise custom kernel switches once per row and vectorises its contiguous case.
+- The shape pass no longer decodes an inline initializer above the known-elements cap (a full graph's weights, every compile).
+- Devices: inline float32 weights (a registered full graph) are uploaded once per executor, not on every run; a float32 initializer
+  takes float16/bfloat16 data (the upload, or the MLX interpreter at create, upcasts it), so a host can pass its 16-bit checkpoint;
+  running out of device memory for a shape's activations is reported as out of memory, with the host's remedy.
 - The plugin layout fingerprint covers the plugin's function table too (a function added at the same ABI version is caught).
 - CUDA discovery loads and initialises NVML once per process and keeps the devices it saw when a later probe fails: a GPU
   no longer vanishes mid-session (an RTX 4090 run lost its device between two models).
