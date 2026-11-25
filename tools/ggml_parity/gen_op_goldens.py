@@ -708,4 +708,82 @@ case("scatterelements_empty_indices", "ScatterElements", {"d": spiked(3, 4), "u"
 case("split_empty_part_is_output", "Split", {"x": spiked(3, 6)}, inits={"split": np.array([6, 0], np.int64)},
      nodes=[helper.make_node("Split", ["x", "split"], ["a", "y"], axis=1)])
 
+
+# Scaled-dot-product attention as the ModernBERT/mmBERT exports spell it: MatMul(q, Transpose(k)) * scale + Where(keep, 0, -FLT_MAX)
+# -> Softmax(-1) -> Cast(float) x2 -> MatMul(., v). The CPU lowering fuses it into one ggml_flash_attn_ext; the goldens hold it to ORT's
+# unfused kernels. 70 query rows reach ggml's tiled kernel (64 rows per tile), 10 rows its per-row kernel. No query row is fully masked
+# (there the fused kernel returns 0 and ORT a uniform average; such rows are padding nobody reads, tested separately in C++).
+def sdpa_case(name, b, h, s, d, keep, scale_first=False, mask_first=False, casts=True, bias=None):
+    q, k, v = rand(b, h, s, d), rand(b, h, s, d), rand(b, h, s, d)
+    inputs = {"q": q, "k": k, "v": v}
+    nodes = [helper.make_node("Transpose", ["k"], ["kt"], perm=[0, 1, 3, 2]), helper.make_node("MatMul", ["q", "kt"], ["qk"]),
+             helper.make_node("Mul", ["scale", "qk"] if scale_first else ["qk", "scale"], ["scaled"])]
+    inits = {"scale": np.float32(1.0 / np.sqrt(d))}
+    last = "scaled"
+    if keep is not None:
+        inputs["keep"] = keep
+        inits.update({"zero": np.float32(0.0), "lowest": np.float32(np.finfo(np.float32).min)})
+        nodes.append(helper.make_node("Where", ["keep", "zero", "lowest"], ["mask"]))
+        nodes.append(helper.make_node("Add", ["mask", last] if mask_first else [last, "mask"], ["masked"]))
+        last = "masked"
+    if bias is not None:
+        inputs["bias"] = bias
+        nodes.append(helper.make_node("Add", [last, "bias"], ["biased"]))
+        last = "biased"
+    nodes.append(helper.make_node("Softmax", [last], ["p"], axis=-1))
+    if casts:
+        nodes += [helper.make_node("Cast", ["p"], ["p1"], to=TensorProto.FLOAT), helper.make_node("Cast", ["p1"], ["p2"], to=TensorProto.FLOAT)]
+    nodes.append(helper.make_node("MatMul", ["p2" if casts else "p", "v"], ["y"]))
+    case(name, "MatMul", inputs, nodes=nodes, inits=inits)
+
+
+def band_keep(s, window, lengths):
+    i, j = np.arange(s)[:, None], np.arange(s)[None, :]
+    keep = np.stack([(np.abs(i - j) <= window) & (j < n) for n in lengths])
+    return keep[:, None, :, :]  # [b, 1, s, s]
+
+
+sdpa_case("sdpa_band_keypad_tiled", 2, 3, 70, 8, band_keep(70, 32, [70, 50]))
+sdpa_case("sdpa_keypad_short_swapped", 2, 2, 10, 4, (np.arange(10)[None, :] < np.array([[10], [6]]))[:, None, None, :],
+          scale_first=True, mask_first=True)
+sdpa_case("sdpa_no_mask", 1, 2, 12, 4, None, casts=False)
+# a real-valued additive bias is not a 0/-max mask: it stays on the unfused path (an F16 mask would round it)
+sdpa_case("sdpa_float_bias_unfused", 1, 2, 12, 4, None, bias=rand(1, 2, 12, 12))
+
+
+# Two attentions over the same 12 keys and the same key-padding mask [b, 1, 1, 12], with 4 and then 9 query rows: the fused lowering
+# repeats the mask to the query length, so a mask prepared for the first must not be reused by the second.
+def two_lengths_case(name):
+    b, h, sk, d = 2, 2, 12, 4
+    k, v, q4, q9 = rand(b, h, sk, d), rand(b, h, sk, d), rand(b, h, 4, d), rand(b, h, 9, d)
+    keep = (np.arange(sk)[None, :] < np.array([[12], [7]]))[:, None, None, :]
+    nodes = [helper.make_node("Transpose", ["k"], ["kt"], perm=[0, 1, 3, 2]),
+             helper.make_node("Where", ["keep", "zero", "lowest"], ["mask"])]
+    for tag in ("q4", "q9"):
+        nodes += [helper.make_node("MatMul", [tag, "kt"], [tag + "_qk"]), helper.make_node("Mul", [tag + "_qk", "scale"], [tag + "_s"]),
+                  helper.make_node("Add", [tag + "_s", "mask"], [tag + "_m"]), helper.make_node("Softmax", [tag + "_m"], [tag + "_p"], axis=-1),
+                  helper.make_node("MatMul", [tag + "_p", "v"], [tag + "_o"])]
+    nodes.append(helper.make_node("Concat", ["q4_o", "q9_o"], ["y"], axis=2))
+    case(name, "MatMul", {"q4": q4, "q9": q9, "k": k, "v": v, "keep": keep}, nodes=nodes,
+         inits={"scale": np.float32(0.5), "zero": np.float32(0.0), "lowest": np.float32(np.finfo(np.float32).min)})
+
+
+two_lengths_case("sdpa_shared_mask_two_query_lengths")
+
+
+# One query row against 600 keys (one test row against many train rows): ggml's split-KV kernel (B = S = 1, at least 512 keys)
+def single_query_case(name):
+    sk, d = 600, 4
+    q, k, v = rand(1, 2, 1, d), rand(1, 2, sk, d), rand(1, 2, sk, d)
+    keep = (np.arange(sk) < 550)[None, None, None, :]
+    nodes = [helper.make_node("Transpose", ["k"], ["kt"], perm=[0, 1, 3, 2]), helper.make_node("MatMul", ["q", "kt"], ["qk"]),
+             helper.make_node("Mul", ["qk", "scale"], ["s"]), helper.make_node("Where", ["keep", "zero", "lowest"], ["mask"]),
+             helper.make_node("Add", ["s", "mask"], ["m"]), helper.make_node("Softmax", ["m"], ["p"], axis=-1),
+             helper.make_node("MatMul", ["p", "v"], ["y"])]
+    case(name, "MatMul", {"q": q, "k": k, "v": v, "keep": keep}, nodes=nodes,
+         inits={"scale": np.float32(0.5), "zero": np.float32(0.0), "lowest": np.float32(np.finfo(np.float32).min)})
+
+
+single_query_case("sdpa_single_query_split_kv")
+
 print(len(os.listdir(OUT)) // 2, "cases in", os.path.normpath(OUT))

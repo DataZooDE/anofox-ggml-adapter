@@ -918,3 +918,60 @@ TEST_CASE("ggml_executor: inline float weights are read in place, not copied per
 	REQUIRE(executor.CompileCount() == 3);
 	REQUIRE(executor.InitializerCopyBytes() == 0);
 }
+
+// Attention at long texts: the unfused lowering materialises the [heads, S, S] scores and runs four passes over them (QK^T, scale, mask,
+// softmax) before PV. The CPU lowering recognises the exported pattern and emits one ggml_flash_attn_ext (the goldens above hold it to
+// ORT's unfused kernels). It fuses only a 0/-max mask from Where (an F16 mask would round a real-valued bias), and only on ggml's CPU
+// backend ("cpu" and the scheduler path "cpu-sched"): a GPU device keeps the lowering its plugins were verified with.
+TEST_CASE("ggml_lowering: scaled-dot-product attention fuses into one flash attention on the CPU", "[adapter][ggml][ggml_ops][attention]") {
+	struct Want {
+		const char *stem;
+		int fused;
+	};
+	for (const Want &w : {Want {"sdpa_band_keypad_tiled", 1}, Want {"sdpa_keypad_short_swapped", 1}, Want {"sdpa_no_mask", 1},
+	                      Want {"sdpa_float_bias_unfused", 0}, Want {"sdpa_shared_mask_two_query_lengths", 2},
+	                      Want {"sdpa_single_query_split_kv", 1}}) {
+		const std::string stem = std::string("test/fixtures/ggml_ops/") + w.stem;
+		INFO("case " << w.stem);
+		const Case c = ReadCase(stem);
+		const auto graph = ReadGraph(stem);
+		for (const std::string device : {"cpu", "cpu-sched"}) {
+			INFO("device " << device);
+			GgmlExecutorConfig config;
+			config.threads = 3;
+			config.device = device;
+			GgmlExecutor executor(graph, config);
+			const auto ops = executor.GraphOpCounts(c.inputs, GgmlRunOptions {});
+			const int fused = ops.count("FLASH_ATTN_EXT") ? ops.at("FLASH_ATTN_EXT") : 0;
+			const int softmax = ops.count("SOFT_MAX") ? ops.at("SOFT_MAX") : 0;
+			const int want = w.fused; // "cpu-sched" runs on the CPU backend too: both paths fuse, so they stay bit-identical
+			REQUIRE(fused == want);
+			REQUIRE(softmax == (want == 0 ? 1 : 0)); // the unfused chain is not computed next to the fused op
+		}
+	}
+}
+
+TEST_CASE("ggml_lowering: a fully masked query row gives finite values under the fused attention", "[adapter][ggml][ggml_ops][attention]") {
+	// Rows whose every key is masked are padding (a padded position far outside the sliding window); nothing reads them, but a NaN there
+	// would poison any later reduction that does not mask it. ORT returns a uniform average there, the fused kernel 0: both finite.
+	const std::string stem = "test/fixtures/ggml_ops/sdpa_band_keypad_tiled";
+	Case c = ReadCase(stem);
+	const auto graph = ReadGraph(stem);
+	HostTensor &keep = c.inputs.at("keep"); // [2, 1, 70, 70]
+	for (int64_t j = 0; j < 70; j++) {
+		keep.data[static_cast<size_t>(1 * 70 * 70 + 69 * 70 + j)] = 0.0f; // batch 1, query row 69: nothing visible
+	}
+	GgmlExecutorConfig config;
+	config.threads = 3;
+	GgmlExecutor executor(graph, config);
+	const auto out = executor.Run(c.inputs, GgmlRunOptions {});
+	const HostTensor &y = out.at("y"); // [2, 3, 70, 8]
+	for (float v : y.data) {
+		REQUIRE(std::isfinite(v));
+	}
+	// every other row is unchanged: batch 0 entirely, against the golden
+	const HostTensor &want = c.outputs.at("y");
+	for (size_t i = 0; i < static_cast<size_t>(3 * 70 * 8); i++) {
+		REQUIRE(SameFloat(y.data[i], want.data[i], true));
+	}
+}

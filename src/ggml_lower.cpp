@@ -1702,6 +1702,167 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 		Fail(n, "operand '" + name + "' is not a float tensor ggml holds");
 	};
 
+	// Scaled-dot-product attention, fused (CPU path only). The exports spell attention as
+	//   MatMul(q, kT) [* scale] [+ Where(keep, 0, -max)] -> Softmax(last axis) [-> Cast(float)...] -> MatMul(., v)
+	// and the unfused lowering materialises the [B, H, S, S] scores and passes over them four times. At the final MatMul the pattern is
+	// traced back from the names; when it matches, one ggml_flash_attn_ext replaces it and the unfused chain (already lowered) is dead, so
+	// it is never computed. Only a mask whose values are 0 or below the float16 range is fused (ggml's mask is float16: a real-valued
+	// bias would be rounded). A GPU device keeps the unfused lowering its plugins were verified with.
+	std::unordered_map<std::string, const ::anofox::onnxread::Node *> producer;
+	for (const auto &nd : graph.nodes) {
+		for (const auto &o : nd.outputs) {
+			if (!o.empty()) {
+				producer[o] = &nd;
+			}
+		}
+	}
+	// "cpu" and "cpu-sched" (the device code path on the CPU backend) run on ggml's CPU backend; "gpu"/"gpu:N" keep the unfused lowering
+	const bool cpu_backend = options.device == "cpu" || options.device == "cpu-sched";
+	std::unordered_map<std::string, ggml_tensor *> f16_masks; // one float16 copy per (mask, query length), shared by the layers that add it
+	auto fuse_attention = [&](const ::anofox::onnxread::Node &n) -> ggml_tensor * {
+		auto made_by = [&](const std::string &t) -> const ::anofox::onnxread::Node * {
+			const auto it = producer.find(t);
+			return it == producer.end() ? nullptr : it->second;
+		};
+		auto value = [&](const std::string &t) -> const ShapeValue * {
+			const auto it = low.shapes.find(t);
+			return it == low.shapes.end() ? nullptr : &it->second;
+		};
+		auto is_f32_data = [&](const std::string &t) {
+			const ShapeValue *v = value(t);
+			return v && !v->known && v->dtype == ShapeDtype::F32;
+		};
+		// through value-preserving ops: Identity, and Cast to float of a float
+		auto through_casts = [&](std::string t) {
+			while (const auto *p = made_by(t)) {
+				const bool float_cast = p->op_type == "Cast" && p->Attr("to") && p->Attr("to")->i == 1 && !p->inputs.empty() && is_f32_data(p->inputs[0]);
+				if (!(float_cast || p->op_type == "Identity")) {
+					break;
+				}
+				t = p->inputs[0];
+			}
+			return t;
+		};
+		auto scalar_of = [&](const std::string &t, double &out) {
+			const ShapeValue *v = value(t);
+			if (!v || !v->known || v->dtype != ShapeDtype::F32 || v->floats.size() != 1) {
+				return false;
+			}
+			out = v->floats[0];
+			return true;
+		};
+		// a 0/-max mask: Where(cond, a, b) with scalar constants a, b each 0 or <= the float16 lowest, seen through shape-only ops
+		auto is_mask = [&](std::string t) {
+			while (const auto *p = made_by(t)) {
+				const std::string &o = p->op_type;
+				if (o == "Expand" || o == "Reshape" || o == "Unsqueeze" || o == "Squeeze" || o == "Identity" ||
+				    (o == "Cast" && p->Attr("to") && p->Attr("to")->i == 1 && !p->inputs.empty() && value(p->inputs[0]) &&
+				     value(p->inputs[0])->dtype == ShapeDtype::F32)) {
+					t = p->inputs.at(0);
+					continue;
+				}
+				if (o != "Where" || p->inputs.size() != 3) {
+					return false;
+				}
+				double a = 1, b = 1;
+				auto masking = [](double x) { return x == 0.0 || x <= -65504.0; };
+				return scalar_of(p->inputs[1], a) && scalar_of(p->inputs[2], b) && masking(a) && masking(b);
+			}
+			return false;
+		};
+
+		const auto *sm = made_by(through_casts(n.inputs.at(0)));
+		if (!sm || sm->op_type != "Softmax" || n.inputs.size() != 2) {
+			return nullptr;
+		}
+		const ShapeValue *sm_in = value(sm->inputs.at(0));
+		if (!sm_in || sm_in->shape.size() != 4) {
+			return nullptr;
+		}
+		const int64_t sm_axis = sm->Attr("axis") ? sm->Attr("axis")->i : -1;
+		if (sm_axis != -1 && sm_axis != 3) {
+			return nullptr;
+		}
+		std::string scores = through_casts(sm->inputs[0]), mask;
+		if (const auto *add = made_by(scores); add && add->op_type == "Add" && add->inputs.size() == 2) {
+			for (int side = 0; side < 2 && mask.empty(); side++) {
+				if (is_f32_data(add->inputs[side]) && is_mask(add->inputs[side])) {
+					mask = add->inputs[side];
+					scores = through_casts(add->inputs[1 - side]);
+				}
+			}
+			if (mask.empty()) {
+				return nullptr; // an additive term that is not a 0/-max mask
+			}
+		}
+		double scale = 1.0;
+		if (const auto *mul = made_by(scores); mul && mul->op_type == "Mul" && mul->inputs.size() == 2) {
+			if (scalar_of(mul->inputs[1], scale)) {
+				scores = through_casts(mul->inputs[0]);
+			} else if (scalar_of(mul->inputs[0], scale)) {
+				scores = through_casts(mul->inputs[1]);
+			} else {
+				return nullptr;
+			}
+		}
+		const auto *qk = made_by(scores);
+		if (!qk || qk->op_type != "MatMul" || qk->inputs.size() != 2) {
+			return nullptr;
+		}
+		const std::string &qn = qk->inputs[0], &ktn = qk->inputs[1], &vn = n.inputs[1];
+		if (!is_f32_data(qn) || !is_f32_data(ktn) || !is_f32_data(vn)) {
+			return nullptr;
+		}
+		const Shape &qs = value(qn)->shape, &kts = value(ktn)->shape, &vs = value(vn)->shape;
+		if (qs.size() != 4 || kts.size() != 4 || vs.size() != 4) {
+			return nullptr;
+		}
+		const int64_t B = qs[0], H = qs[1], S = qs[2], D = qs[3], SK = kts[3];
+		if (kts[0] != B || kts[1] != H || kts[2] != D || vs[0] != B || vs[1] != H || vs[2] != SK) {
+			return nullptr; // broadcast batch or head dimensions: left to the unfused lowering
+		}
+		const ShapeValue *out_value = value(n.outputs.at(0));
+		if (!out_value || out_value->shape != Shape {B, H, S, vs[3]}) {
+			return nullptr;
+		}
+		Shape ms; // the mask's shape right-aligned to four dimensions; checked before any tensor is created
+		if (!mask.empty()) {
+			ms = value(mask)->shape;
+			if (ms.size() > 4) {
+				return nullptr;
+			}
+			ms.insert(ms.begin(), 4 - ms.size(), 1);
+			if (ms[3] != SK || (ms[2] != 1 && ms[2] != S) || (ms[1] != 1 && ms[1] != H) || (ms[0] != 1 && ms[0] != B)) {
+				return nullptr;
+			}
+		}
+		ggml_context *c = ctx.get();
+		auto rows_contiguous = [&](ggml_tensor *t) { return t->nb[0] == ggml_type_size(t->type) ? t : ggml_cont(c, t); };
+		ggml_tensor *q = rows_contiguous(tensor_of(n, qn));                                          // ne [D, S, H, B]
+		ggml_tensor *k = rows_contiguous(ggml_transpose(c, tensor_of(n, ktn)));                     // kT [SK, D, H, B] -> [D, SK, H, B]
+		ggml_tensor *v = rows_contiguous(tensor_of(n, vn));                                          // ne [Dv, SK, H, B]
+		ggml_tensor *m16 = nullptr;
+		if (!mask.empty()) {
+			// The kernel reads one mask row per query row (no broadcast over queries), so a key-padding mask is repeated to S rows: the
+			// float16 copy depends on S, and attentions over the same mask with other query lengths need their own.
+			const std::string key = mask + "#" + std::to_string(S);
+			auto cached = f16_masks.find(key);
+			if (cached != f16_masks.end()) {
+				m16 = cached->second;
+			} else {
+				ggml_tensor *m = low.Contiguous(tensor_of(n, mask));
+				m = ggml_reshape_4d(c, m, SK, ms[2], ms[1], ms[0]);
+				if (ms[2] != S) {
+					m = ggml_repeat(c, m, ggml_new_tensor_4d(c, GGML_TYPE_F32, SK, S, ms[1], ms[0]));
+				}
+				m16 = ggml_cast(c, m, GGML_TYPE_F16);
+				f16_masks[key] = m16;
+			}
+		}
+		ggml_tensor *fa = ggml_flash_attn_ext(c, q, k, v, m16, static_cast<float>(scale), 0.0f, 0.0f);
+		return ggml_permute(c, fa, 0, 2, 1, 3); // [Dv, H, S, B] -> the MatMul's [Dv, S, H, B]
+	};
+
 	for (const auto &n : graph.nodes) {
 		bool needed_here = false;
 		for (const auto &o : n.outputs) {
@@ -1914,6 +2075,8 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 				}
 			}
 			out = sh(0).size() > 4 ? low.TransposeBig(n, in(0), sh(0), perm, out_shape) : low.Permute(in(0), perm);
+		} else if (op == "MatMul" && cpu_backend && (out = fuse_attention(n)) != nullptr) {
+			// the fused attention (above)
 		} else if (op == "MatMul") {
 			const Shape &sa = sh(0), &sb = sh(1);
 			if (sa.size() > 4 || sb.size() > 4 || out_shape.size() > 4) {
@@ -2808,6 +2971,7 @@ Compiled *GgmlExecutor::Impl::Acquire(const HostTensors &inputs, const GgmlRunOp
 	GgmlRunOptions compile_options = options;
 	compile_options.weights = impl.config.weights;
 	compile_options.strict_fp32 = impl.config.strict_fp32;
+	compile_options.device = impl.config.device; // the lowering fuses attention only where the CPU backend runs the graph
 	WeightProvider provider;
 	if (!impl.runtime.sched_backends.empty()) {
 		provider = [&impl](const std::string &name, const Ne4 &ne, const float *host, int onnx_type) { return impl.DeviceWeight(name, ne, host, onnx_type); };
@@ -2837,6 +3001,17 @@ std::vector<int64_t> GgmlExecutor::MulMatActivationRows(const HostTensors &input
 		}
 	}
 	return rows;
+}
+
+std::map<std::string, int> GgmlExecutor::GraphOpCounts(const HostTensors &inputs, const GgmlRunOptions &options) {
+	std::lock_guard<std::mutex> guard(impl_->mutex);
+	std::unique_ptr<Compiled> transient;
+	Compiled *compiled = impl_->Acquire(inputs, options, transient);
+	std::map<std::string, int> counts;
+	for (int i = 0; i < ggml_graph_n_nodes(compiled->g); i++) {
+		counts[ggml_op_name(ggml_graph_node(compiled->g, i)->op)]++;
+	}
+	return counts;
 }
 
 HostTensors GgmlExecutor::Run(const HostTensors &inputs, const GgmlRunOptions &options) {
