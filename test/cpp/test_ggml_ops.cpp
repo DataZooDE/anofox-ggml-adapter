@@ -1043,3 +1043,23 @@ TEST_CASE("ggml_lowering: the fused attention copies no activations around it", 
 		REQUIRE(ops.at("CONT") == 1);
 	}
 }
+
+TEST_CASE("ggml_lowering: the exact-GELU pattern lowers to one gelu_erf", "[adapter][ggml][ggml_ops][gelu]") {
+	// Five ops, three of them CPU-only custom kernels over the MLP activations, become one native unary op (multi-threaded on the CPU,
+	// on the device for the GPU plugins). The goldens above hold its values to ONNX Runtime's.
+	for (const char *stem : {"gelu_erf_pattern", "gelu_erf_pattern_swapped"}) {
+		const std::string path = std::string("test/fixtures/ggml_ops/") + stem;
+		const Case c = ReadCase(path);
+		const auto graph = ReadGraph(path);
+		for (const std::string device : {"cpu", "cpu-sched"}) {
+			INFO("case " << stem << ", device " << device);
+			GgmlExecutorConfig config;
+			config.threads = 2;
+			config.device = device;
+			GgmlExecutor executor(graph, config);
+			const auto ops = executor.GraphOpCounts(c.inputs, GgmlRunOptions {});
+			REQUIRE(ops.count("UNARY") == 1);
+			REQUIRE(ops.count("CUSTOM") == 0);
+		}
+	}
+}

@@ -1887,6 +1887,54 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 		return ggml_permute(c, fa, 0, 2, 1, 3); // [Dv, H, S, B] -> the MatMul's [Dv, S, H, B]
 	};
 
+	// Exact GELU, as the encoder exports spell it: Mul(Mul(x, Add(Erf(Div(x, sqrt 2)), 1)), 0.5) (operands in either order). Three of those
+	// five ops are CPU-only custom kernels over the MLP activations (a device round trip per layer on a GPU); ggml_gelu_erf is one native
+	// pass. It computes erf(x * 0.70710678) for erf(x / 1.4142135): within an ulp of the argument (accepted, held to Erf's tolerance).
+	auto fuse_gelu = [&](const ::anofox::onnxread::Node &n) -> ggml_tensor * {
+		auto made_by = [&](const std::string &t) -> const ::anofox::onnxread::Node * {
+			const auto it = producer.find(t);
+			return it == producer.end() ? nullptr : it->second;
+		};
+		auto scalar = [&](const std::string &t, double want, double tol) {
+			const auto it = low.shapes.find(t);
+			return it != low.shapes.end() && it->second.known && it->second.dtype == ShapeDtype::F32 && it->second.floats.size() == 1 &&
+			       std::fabs(it->second.floats[0] - want) <= tol;
+		};
+		// the operand of binary node `p` that is not the scalar constant `want`, or "" when neither is
+		auto other_than = [&](const ::anofox::onnxread::Node *p, const char *op, double want, double tol) -> std::string {
+			if (!p || p->op_type != op || p->inputs.size() != 2) {
+				return "";
+			}
+			return scalar(p->inputs[1], want, tol) ? p->inputs[0] : scalar(p->inputs[0], want, tol) ? p->inputs[1] : "";
+		};
+		if (n.inputs.size() != 2) {
+			return nullptr;
+		}
+		const std::string m = other_than(&n, "Mul", 0.5, 0.0); // ... * 0.5
+		const auto *mul = made_by(m);
+		if (m.empty() || !mul || mul->op_type != "Mul" || mul->inputs.size() != 2) {
+			return nullptr;
+		}
+		for (int side = 0; side < 2; side++) { // x * (erf(x / sqrt 2) + 1), either order
+			const std::string &x = mul->inputs[side], &a = mul->inputs[1 - side];
+			const std::string e = other_than(made_by(a), "Add", 1.0, 0.0);
+			const auto *erf = made_by(e);
+			if (e.empty() || !erf || erf->op_type != "Erf" || erf->inputs.size() != 1) {
+				continue;
+			}
+			const auto *div = made_by(erf->inputs[0]);
+			if (!div || div->op_type != "Div" || div->inputs.size() != 2 || div->inputs[0] != x || !scalar(div->inputs[1], std::sqrt(2.0), 1e-6)) {
+				continue;
+			}
+			const auto xv = low.shapes.find(x);
+			if (xv == low.shapes.end() || xv->second.known || xv->second.dtype != ShapeDtype::F32 || xv->second.shape != low.shapes.at(n.outputs.at(0)).shape) {
+				return nullptr;
+			}
+			return ggml_gelu_erf(ctx.get(), low.Contiguous(tensor_of(n, x)));
+		}
+		return nullptr;
+	};
+
 	for (const auto &n : graph.nodes) {
 		bool needed_here = false;
 		for (const auto &o : n.outputs) {
@@ -2069,6 +2117,8 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 			      : op == "Exp"  ? ggml_exp(ctx.get(), x)
 			      : op == "Log"  ? ggml_log(ctx.get(), x)
 			                     : ggml_tanh(ctx.get(), x);
+		} else if (op == "Mul" && (out = fuse_gelu(n)) != nullptr) {
+			// the fused exact GELU (above)
 		} else if (op == "Add" || op == "Sub" || op == "Mul" || op == "Div") {
 			// Integers computed from float data live as floats; ONNX integer Div truncates toward zero.
 			const bool integer_div = op == "Div" && low.shapes.at(n.outputs.at(0)).dtype == ShapeDtype::I64;
