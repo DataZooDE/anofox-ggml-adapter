@@ -339,6 +339,10 @@ int CgroupCpuLimitFrom(const std::string &cgroup_root) {
 	return ceil_div(quota, period);
 }
 
+int AppleCoresFrom(int perflevel0_physicalcpu, int physicalcpu) {
+	return perflevel0_physicalcpu > 0 ? perflevel0_physicalcpu : physicalcpu;
+}
+
 int PhysicalCpuCores() {
 	static const int cores = [] {
 		int n = 0;
@@ -358,10 +362,13 @@ int PhysicalCpuCores() {
 			n = quota;
 		}
 #elif defined(__APPLE__)
-		int value = 0;
-		size_t size = sizeof(value);
+		int value = 0, perf = 0;
+		size_t size = sizeof(value), perf_size = sizeof(perf);
+		if (sysctlbyname("hw.perflevel0.physicalcpu", &perf, &perf_size, nullptr, 0) != 0) {
+			perf = 0;
+		}
 		if (sysctlbyname("hw.physicalcpu", &value, &size, nullptr, 0) == 0) {
-			n = value;
+			n = AppleCoresFrom(perf, value);
 		}
 #elif defined(_WIN32)
 		DWORD bytes = 0;

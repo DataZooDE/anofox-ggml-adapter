@@ -35,7 +35,8 @@ bool CudaComputeCapabilityUsable(int major, int minor);
 //! The number of physical CPU cores this process may run on (SMT siblings counted once), at least 1. The CPU engine is fastest with
 //! one thread per physical core: on an SMT machine a second thread per core adds no arithmetic throughput, and every op's barrier
 //! waits for the slowest thread (measured on a 12-core / 24-thread Ryzen AI: 25 s at 12 threads, 35 s at 24, the same answers).
-//! Linux reads sysfs topology, macOS hw.physicalcpu, Windows the logical processor information; std::thread's count elsewhere.
+//! Linux reads sysfs topology, macOS its performance cores (AppleCoresFrom), Windows the logical processor information; std::thread's
+//! count elsewhere.
 int PhysicalCpuCores();
 
 //! PhysicalCpuCores() over a sysfs cpu directory (a test seam: /sys/devices/system/cpu on a real machine), counting the distinct
@@ -48,6 +49,10 @@ int PhysicalCpuCoresFrom(const std::string &cpu_dir, const std::vector<int> &all
 //! cpu/cpu.cfs_period_us for v1); 0 when there is no quota. PhysicalCpuCores() is capped by it on Linux: a container limited
 //! to 2 CPUs on a 64-core host must not run 64 threads that hit barriers while throttled.
 int CgroupCpuLimitFrom(const std::string &cgroup_root);
+
+//! The engine's cores on macOS from sysctl's hw.perflevel0.physicalcpu (the performance cores; <= 0 when the machine reports no
+//! perflevels) and hw.physicalcpu: the performance cores on Apple Silicon, whose efficiency cores slow every barrier; all cores otherwise.
+int AppleCoresFrom(int perflevel0_physicalcpu, int physicalcpu);
 
 //! The gfx architectures the released ROCm plugin carries code objects for.
 const std::vector<std::string> &GgmlRocmPluginArchs();

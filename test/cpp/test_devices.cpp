@@ -154,3 +154,12 @@ TEST_CASE("devices: discovery always yields the usable cpu row first, and unique
 		REQUIRE(d.device_ordinal >= 0);
 	}
 }
+
+TEST_CASE("devices: on Apple Silicon the engine counts the performance cores", "[adapter][devices]") {
+	// An M3 has 4 performance and 4 efficiency cores (hw.physicalcpu = 8). Every op of the engine ends on a barrier that waits for the
+	// slowest thread, so threads on the efficiency cores slow it down (laya-typed-decisions at 470 tokens: 139 s on 8 threads, 100 s on 4).
+	REQUIRE(AppleCoresFrom(4, 8) == 4);  // perflevel0 = the performance cluster
+	REQUIRE(AppleCoresFrom(0, 8) == 8);  // no perflevels (an Intel Mac, older macOS): every physical core
+	REQUIRE(AppleCoresFrom(-1, 10) == 10);
+	REQUIRE(AppleCoresFrom(12, 16) == 12); // M-series Max: 12 performance + 4 efficiency
+}
