@@ -25,6 +25,8 @@
   instead of materialising the `[B, H, S, S]` scores. A real-valued additive bias, broadcast batch/head dimensions and the device
   path (the GPU plugins) keep the unfused lowering. A query row with every key masked (padding) now gives 0 instead of ORT's
   uniform average. `GgmlExecutor::GraphOpCounts()` reports the ops of a compiled graph (a test hook).
+  A query row's result does not depend on how many rows share the batch: fewer than 64 query rows are padded to the
+  tiled kernel's 64 (ggml picks its flash-attention kernel by row count, and the kernels sum in different orders).
 - The plugin layout fingerprint covers the plugin's function table too (a function added at the same ABI version is caught).
 - CUDA discovery loads and initialises NVML once per process and keeps the devices it saw when a later probe fails: a GPU
   no longer vanishes mid-session (an RTX 4090 run lost its device between two models).
