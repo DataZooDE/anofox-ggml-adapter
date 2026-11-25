@@ -10,6 +10,7 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #if defined(__linux__)
 #include <sched.h>
@@ -1350,6 +1351,7 @@ bool IsHost(const ShapeValue &v) {
 //! the context outlives everything that points into it.
 struct Compiled {
 	std::string signature;
+	uint64_t id = 0; // unique for the process (an address can be reused after a graph is evicted; this cannot)
 	ggml_context_ptr ctx;
 	ggml_cgraph *g = nullptr;
 	ggml_backend_buffer_ptr external_marker;
@@ -1375,7 +1377,6 @@ struct Compiled {
 	std::vector<std::pair<std::string, ggml_tensor *>> outputs;
 	std::map<std::string, Shape> output_shapes;
 	HostTensors host_outputs; // outputs the host folded (integers, bool masks, constants): identical on every run of this signature
-	ggml_gallocr_ptr alloc;   // the activation arena, kept across runs (the plain CPU path)
 	ggml_backend_sched_ptr sched; // the scheduler path (a device, or "cpu-sched"): owns the activation buffers instead
 	bool sched_ready = false;     // split and allocated once (see ExecuteCompiled)
 	//! Device mode: a leaf is an ordinary tensor the scheduler allocates in device memory (a GPU kernel cannot read a host pointer), uploaded at every run.
@@ -1480,6 +1481,8 @@ std::string SignatureOf(const ::anofox::onnxread::Graph &graph, const HostTensor
 std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, const HostTensors &inputs, const GgmlRunOptions &options,
                                        const WeightLookup &weights, const WeightProvider &provider) {
 	auto compiled = std::make_unique<Compiled>();
+	static std::atomic<uint64_t> next_compiled_id {1};
+	compiled->id = next_compiled_id++;
 	compiled->device_mode = static_cast<bool>(provider);
 	compiled->signature = SignatureOf(graph, inputs, options);
 	PhaseClock clock;
@@ -2678,8 +2681,17 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 //! Run a compiled graph: point the input leaves at this call's buffers, allocate the activation arena (kept for the next run), compute, read the
 //! outputs. The weights are read where the caller keeps them; nothing is copied in.
 //! The backends one executor computes on.
+//! The plain CPU path's activation arena, one per executor: sized for the largest cached graph rather than one arena per cached shape.
+//! ggml's allocator replans only when a graph's node count or sizes change, so a different graph of the same counts would run on the
+//! previous graph's plan: the arena remembers which graph it planned for and replans on every switch.
+struct SharedArena {
+	ggml_gallocr_ptr alloc;
+	uint64_t planned_for = 0;
+};
+
 struct ExecutorRuntime {
 	ggml_backend_t cpu = nullptr;                    // always present; runs the custom kernels and, for device "cpu", everything
+	SharedArena *arena = nullptr;                    // the executor's (see SharedArena)
 	ggml_threadpool_t pool = nullptr;
 	int threads = 1;
 	std::vector<ggml_backend_t> sched_backends;      // scheduler path: the device first, the CPU last (empty = plain CPU path)
@@ -2869,10 +2881,18 @@ HostTensors ExecuteCompiled(Compiled &c, const ExecutorRuntime &rt, const HostTe
 		}
 		return ReadOutputs(c);
 	}
-	if (!c.alloc) {
-		c.alloc.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend)));
+	SharedArena &arena = *rt.arena;
+	if (!arena.alloc) {
+		arena.alloc.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend)));
 	}
-	if (!c.alloc || !ggml_gallocr_alloc_graph(c.alloc.get(), c.g)) {
+	if (arena.alloc && arena.planned_for != c.id) {
+		arena.planned_for = 0;
+		if (!ggml_gallocr_reserve(arena.alloc.get(), c.g)) { // plans this graph (the buffer only ever grows: the largest graph sizes it)
+			throw std::runtime_error("ggml lowering: could not allocate the compute buffers");
+		}
+		arena.planned_for = c.id;
+	}
+	if (!arena.alloc || !ggml_gallocr_alloc_graph(arena.alloc.get(), c.g)) {
 		throw std::runtime_error("ggml lowering: could not allocate the compute buffers");
 	}
 	clock.Lap("gallocr alloc");
@@ -2915,6 +2935,7 @@ struct GgmlExecutor::Impl {
 	std::map<std::string, ggml_tensor *> weights_on_device;
 	std::list<std::unique_ptr<Compiled>> cache; // most recently used first
 	size_t compiles = 0;
+	SharedArena arena; // the plain CPU path's activations, shared by every cached graph
 
 	Impl(const ::anofox::onnxread::Graph &graph_p, GgmlExecutorConfig config_p) : graph(graph_p), config(std::move(config_p)) {
 		try {
@@ -2956,6 +2977,7 @@ struct GgmlExecutor::Impl {
 			pool = ggml_threadpool_new(&params);
 		}
 		runtime.cpu = cpu.get();
+		runtime.arena = &arena;
 		runtime.pool = pool;
 		runtime.threads = config.threads;
 		if (config.device == "cpu") {
@@ -3226,6 +3248,12 @@ size_t GgmlExecutor::PreloadWeights() {
 void GgmlExecutor::Trim() {
 	std::lock_guard<std::mutex> guard(impl_->mutex);
 	impl_->cache.clear();
+	impl_->arena = SharedArena {}; // and their activation memory
+}
+
+size_t GgmlExecutor::ActivationBytes() const {
+	std::lock_guard<std::mutex> guard(impl_->mutex);
+	return impl_->arena.alloc ? ggml_gallocr_get_buffer_size(impl_->arena.alloc.get(), 0) : 0;
 }
 
 size_t GgmlExecutor::CompileCount() const {

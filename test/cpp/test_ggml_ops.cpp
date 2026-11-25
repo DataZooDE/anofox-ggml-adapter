@@ -1092,3 +1092,36 @@ TEST_CASE("ggml_lowering: token ids from a graph input gather an embedding with 
 		REQUIRE(SameBits(out.at("y").data[0], c.outputs.at("y").data[0]));
 	}
 }
+
+TEST_CASE("ggml_executor: one activation arena serves every cached shape, sized for the largest", "[adapter][ggml][ggml_ops][arena]") {
+	// Each cached input shape kept its own arena: a host scoring texts of many lengths held up to cache_entries arenas at once.
+	::anofox::onnxread::Graph g;
+	g.inputs = {"x"};
+	g.nodes = {MakeNode("Exp", {"x"}, "e"), MakeNode("Mul", {"e", "x"}, "m"), MakeNode("Add", {"m", "e"}, "y")};
+	g.outputs = {"y"};
+	auto input = [](int64_t rows) {
+		HostTensors in;
+		in["x"] = HostTensor {{rows, 256}, std::vector<float>(static_cast<size_t>(rows * 256), 0.5f)};
+		return in;
+	};
+	GgmlExecutorConfig config;
+	config.threads = 2;
+	config.cache_entries = 4;
+	size_t large_alone = 0;
+	{
+		GgmlExecutor alone(g, config);
+		alone.Run(input(512), GgmlRunOptions {});
+		large_alone = alone.ActivationBytes();
+		REQUIRE(large_alone > 0);
+	}
+	GgmlExecutor executor(g, config);
+	std::vector<float> first;
+	for (int64_t rows : {512, 8, 64, 512, 8}) {
+		const auto out = executor.Run(input(rows), GgmlRunOptions {});
+		REQUIRE(out.at("y").data.size() == static_cast<size_t>(rows * 256));
+		const float want = std::exp(0.5f) * 0.5f + std::exp(0.5f);
+		REQUIRE(std::fabs(out.at("y").data.back() - want) < 1e-5f); // each shape still computes on a valid plan of its own graph
+	}
+	REQUIRE(executor.CompileCount() == 3);
+	REQUIRE(executor.ActivationBytes() == large_alone);
+}
