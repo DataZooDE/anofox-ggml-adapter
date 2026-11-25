@@ -808,12 +808,14 @@ Graph::Graph(const std::string &graph_path, const void *graph_data, size_t graph
 			}
 			if (upcast) {
 				// A 16-bit checkpoint for a float32 graph (the host passes its mapped checkpoint instead of an upcast copy): converted
-				// once here, so the graph runs in float32 as declared.
-				mlx_stream cpu = mlx_default_cpu_stream_new();
+				// once here, so the graph runs in float32 as declared. On the GPU stream, as decide's own MLX plugin did: converted on the
+				// CPU, the float32 copy was CPU-written memory, ~1.5 GB more resident set for Laya on an M3 than the same weights written by
+				// the GPU.
+				mlx_stream gpu_stream = mlx_default_gpu_stream_new();
 				Arr narrow = TensorArray(w->second.data, shape, w->second.dtype);
 				mlx_array wide = mlx_array_new();
-				const int st = mlx_astype(&wide, narrow.get(), MLX_FLOAT32, cpu);
-				mlx_stream_free(cpu);
+				const int st = mlx_astype(&wide, narrow.get(), MLX_FLOAT32, gpu_stream);
+				mlx_stream_free(gpu_stream);
 				if (st != 0 || mlx_array_eval(wide) != 0) {
 					mlx_array_free(wide);
 					Fail("could not convert the 16-bit weight '" + t.name + "' to float32");
@@ -836,6 +838,8 @@ Graph::Graph(const std::string &graph_path, const void *graph_data, size_t graph
 		}
 		impl_->initializers.emplace(t.name, TensorArray(bytes, shape, t.data_type));
 	}
+	// The 16-bit copies freed by the upcasts above sit in MLX's buffer cache until something reuses them: hand them back now.
+	mlx_clear_cache();
 
 	// Last-use analysis. A value may be dropped once the last node reading it
 	// has run -- except graph outputs, and except initializers, which are owned
@@ -1131,6 +1135,9 @@ std::map<std::string, Tensor> Graph::Run(const std::vector<std::pair<std::string
 		results[name] = std::move(result);
 	}
 	mlx_stream_free(gpu);
+	// MLX keeps a run's freed buffers in its cache for reuse; held between runs they were ~0.3 GB of GPU memory (900 buffers) for Laya on
+	// an M3. Released here: no measurable cost (decide's 400-call julia-1 run 10.9 s either way).
+	mlx_clear_cache();
 	return results;
 }
 
