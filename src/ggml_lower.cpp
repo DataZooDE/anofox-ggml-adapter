@@ -1481,9 +1481,8 @@ std::string SignatureOf(const ::anofox::onnxread::Graph &graph, const HostTensor
 	return key;
 }
 
-//! `device`: the GPU backend the graph runs on (null on the CPU paths); a fusion is used there only when it supports the fused op.
 std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, const HostTensors &inputs, const GgmlRunOptions &options,
-                                       const WeightLookup &weights, const WeightProvider &provider, ggml_backend_t device = nullptr) {
+                                       const WeightLookup &weights, const WeightProvider &provider) {
 	auto compiled = std::make_unique<Compiled>();
 	static std::atomic<uint64_t> next_compiled_id {1};
 	compiled->id = next_compiled_id++;
@@ -1750,12 +1749,12 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 		Fail(n, "operand '" + name + "' is not a float tensor ggml holds");
 	};
 
-	// Scaled-dot-product attention, fused (the CPU backend, and a GPU whose backend supports the op). The exports spell attention as
+	// Scaled-dot-product attention, fused on the CPU backend (see cpu_backend below for why not on a GPU). The exports spell attention as
 	//   MatMul(q, kT) [* scale] [+ Where(keep, 0, -max)] -> Softmax(last axis) [-> Cast(float)...] -> MatMul(., v)
 	// and the unfused lowering materialises the [B, H, S, S] scores and passes over them four times. At the final MatMul the pattern is
 	// traced back from the names; when it matches, one ggml_flash_attn_ext replaces it and the unfused chain (already lowered) is dead, so
 	// it is never computed. Only a mask whose values are 0 or below the float16 range is fused (ggml's mask is float16: a real-valued
-	// bias would be rounded). A GPU that cannot run the fused op keeps the unfused lowering.
+	// bias would be rounded).
 	std::unordered_map<std::string, const ::anofox::onnxread::Node *> producer;
 	for (const auto &nd : graph.nodes) {
 		for (const auto &o : nd.outputs) {
@@ -1764,10 +1763,10 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 			}
 		}
 	}
-	// "cpu" and "cpu-sched" (the device code path on the CPU backend) run on ggml's CPU backend, which runs the fused attention. A GPU
-	// fuses only when its backend supports the op built (else the scheduler would move the whole attention to the CPU): checked per site.
+	// "cpu" and "cpu-sched" (the device code path on the CPU backend) run on ggml's CPU backend, whose flash attention accumulates in
+	// float32. A GPU keeps the unfused attention: ROCm's flash-attention kernels moved decide's probabilities by up to 5e-3 against the
+	// CPU (the GPU bar is 1e-3; unfused 5e-5), measured on gfx1150.
 	const bool cpu_backend = options.device == "cpu" || options.device == "cpu-sched";
-	auto fusable_here = [&](ggml_tensor *fused) { return cpu_backend || (device && ggml_backend_supports_op(device, fused)); };
 	std::unordered_map<std::string, ggml_tensor *> f16_masks; // one float16 copy per (mask, query length), shared by the layers that add it
 	auto fuse_attention = [&](const ::anofox::onnxread::Node &n) -> ggml_tensor * {
 		auto made_by = [&](const std::string &t) -> const ::anofox::onnxread::Node * {
@@ -1930,9 +1929,6 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 			}
 		}
 		ggml_tensor *fa = ggml_flash_attn_ext(c, q, k, v, m16, static_cast<float>(scale), 0.0f, 0.0f);
-		if (!fusable_here(fa)) {
-			return nullptr; // the device cannot run it: the unfused lowering (the tensors made above are never computed)
-		}
 		if (SQ != S) {
 			fa = ggml_view_4d(c, fa, fa->ne[0], fa->ne[1], S, fa->ne[3], fa->nb[1], fa->nb[2], fa->nb[3], 0); // [Dv, H, SQ, B] -> the first S rows
 		}
@@ -2201,7 +2197,7 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 				}
 			}
 			out = sh(0).size() > 4 ? low.TransposeBig(n, in(0), sh(0), perm, out_shape) : low.Permute(in(0), perm);
-		} else if (op == "MatMul" && (cpu_backend || device) && (out = fuse_attention(n)) != nullptr) {
+		} else if (op == "MatMul" && cpu_backend && (out = fuse_attention(n)) != nullptr) {
 			// the fused attention (above)
 		} else if (op == "MatMul") {
 			const Shape &sa = sh(0), &sb = sh(1);
@@ -3157,7 +3153,7 @@ Compiled *GgmlExecutor::Impl::Acquire(const HostTensors &inputs, const GgmlRunOp
 	if (!impl.runtime.sched_backends.empty()) {
 		provider = [&impl](const std::string &name, const Ne4 &ne, const float *host, int onnx_type) { return impl.DeviceWeight(name, ne, host, onnx_type); };
 	}
-	auto fresh = CompileGraph(impl.graph, inputs, compile_options, impl.config.weights, provider, impl.device.get());
+	auto fresh = CompileGraph(impl.graph, inputs, compile_options, impl.config.weights, provider);
 	impl.compiles++;
 	if (discard_after) {
 		transient = std::move(fresh);
