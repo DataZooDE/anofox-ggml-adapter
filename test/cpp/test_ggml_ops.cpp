@@ -501,7 +501,37 @@ TEST_CASE("ggml_executor: PreloadWeights uploads the external weights up front o
 	}
 }
 
+//! Sets an environment variable for one scope (POSIX and Windows), restoring the previous value.
+struct ScopedEnv {
+	std::string name, old;
+	bool had = false;
+	ScopedEnv(const char *n, const char *value) : name(n) {
+		if (const char *v = std::getenv(n)) {
+			had = true;
+			old = v;
+		}
+		Set(value);
+	}
+	~ScopedEnv() {
+		Set(had ? old.c_str() : nullptr);
+	}
+	void Set(const char *value) {
+#ifdef _WIN32
+		_putenv_s(name.c_str(), value ? value : "");
+#else
+		if (value) {
+			setenv(name.c_str(), value, 1);
+		} else {
+			unsetenv(name.c_str());
+		}
+#endif
+	}
+};
+
 TEST_CASE("ggml_executor: strict fp32 pads every weight matmul past the 16-row small-batch kernel and keeps the results", "[adapter][ggml][ggml_ops]") {
+	// A GPU's matmul nodes are inspected through the scheduler path on the CPU backend, where an Apple build would run them on Accelerate
+	// (no MUL_MAT node left to see): off for this test.
+	ScopedEnv no_accelerate("ANOFOX_GGML_NO_ACCELERATE", "1");
 	// ggml's CUDA small-batch matmul (<= 16 activation rows) runs TF32 tensor-core instructions that the NVIDIA TF32 switch cannot turn off; strict fp32 must
 	// route every weight matmul to the cuBLAS path by giving it more than 16 rows. A MatMul graph and the Einsum "...s,jhds->...jhd" site both go through it.
 	const std::vector<float> weights = [] {
