@@ -2692,6 +2692,7 @@ struct SharedArena {
 struct ExecutorRuntime {
 	ggml_backend_t cpu = nullptr;                    // always present; runs the custom kernels and, for device "cpu", everything
 	SharedArena *arena = nullptr;                    // the executor's (see SharedArena)
+	std::string out_of_memory_remedy;                // the host's advice (GgmlExecutorConfig), appended to a device out-of-memory error
 	ggml_threadpool_t pool = nullptr;
 	int threads = 1;
 	std::vector<ggml_backend_t> sched_backends;      // scheduler path: the device first, the CPU last (empty = plain CPU path)
@@ -2854,7 +2855,9 @@ HostTensors ExecuteCompiled(Compiled &c, const ExecutorRuntime &rt, const HostTe
 			}
 			if (!ggml_backend_sched_alloc_graph(c.sched.get(), c.g)) {
 				c.sched.reset();
-				throw std::runtime_error("ggml lowering: could not allocate the device compute buffers");
+				// the activations of this input shape do not fit next to the weights: worded so the host recognises it as out of memory
+				throw std::runtime_error("ggml lowering: out of device memory allocating the compute buffers for this input shape. " +
+				                         rt.out_of_memory_remedy);
 			}
 			c.sched_ready = true;
 			clock.Lap("sched alloc");
@@ -2978,6 +2981,7 @@ struct GgmlExecutor::Impl {
 		}
 		runtime.cpu = cpu.get();
 		runtime.arena = &arena;
+		runtime.out_of_memory_remedy = config.out_of_memory_remedy;
 		runtime.pool = pool;
 		runtime.threads = config.threads;
 		if (config.device == "cpu") {

@@ -244,7 +244,8 @@ const char *const *PluginGraphInputs(void *handle) {
 }
 
 bool IsMemoryError(const std::string &what) {
-	return what.find("out of memory") != std::string::npos || what.find("failed to allocate") != std::string::npos;
+	return what.find("out of memory") != std::string::npos || what.find("out of device memory") != std::string::npos ||
+	       what.find("failed to allocate") != std::string::npos;
 }
 
 AnofoxGgmlPluginStatus PluginRun(void *handle, const AnofoxGgmlTensorIn *inputs, size_t input_count, const char *const *outputs,
