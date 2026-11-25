@@ -1063,3 +1063,32 @@ TEST_CASE("ggml_lowering: the exact-GELU pattern lowers to one gelu_erf", "[adap
 		}
 	}
 }
+
+TEST_CASE("ggml_lowering: token ids from a graph input gather an embedding with get_rows, and an out-of-range id is refused", "[adapter][ggml][ggml_ops][embedding]") {
+	// The embedding lookup was a single-threaded host kernel; on a GPU it made the scheduler copy the whole table to the host every run.
+	const std::string stem = "test/fixtures/ggml_ops/gather_input_ids_embedding"; // table [11, 6], ids [2, 5] int64 graph input
+	const Case c = ReadCase(stem);
+	const auto graph = ReadGraph(stem);
+	for (const std::string device : {"cpu", "cpu-sched"}) {
+		INFO("device " << device);
+		GgmlExecutorConfig config;
+		config.threads = 2;
+		config.device = device;
+		GgmlExecutor executor(graph, config);
+		const auto ops = executor.GraphOpCounts(c.inputs, GgmlRunOptions {});
+		REQUIRE(ops.count("GET_ROWS") == 1);
+		REQUIRE(ops.count("CUSTOM") == 0);
+		HostTensors bad = c.inputs;
+		bad.at("ids").data[3] = 11.0f; // one past the table
+		try {
+			executor.Run(bad, GgmlRunOptions {});
+			FAIL("an out-of-range token id was accepted");
+		} catch (const std::exception &e) {
+			INFO(e.what());
+			REQUIRE(std::string(e.what()).find("out of range") != std::string::npos);
+			REQUIRE(std::string(e.what()).find("11") != std::string::npos);
+		}
+		const auto out = executor.Run(c.inputs, GgmlRunOptions {}); // a refused run does not poison the next
+		REQUIRE(SameBits(out.at("y").data[0], c.outputs.at("y").data[0]));
+	}
+}

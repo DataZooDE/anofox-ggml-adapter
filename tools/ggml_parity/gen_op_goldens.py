@@ -786,7 +786,6 @@ def single_query_case(name):
 
 single_query_case("sdpa_single_query_split_kv")
 
-print(len(os.listdir(OUT)) // 2, "cases in", os.path.normpath(OUT))
 
 
 # Exact GELU as the ModernBERT/mmBERT exports spell it: Mul(Mul(x, Add(Erf(Div(x, sqrt 2)), 1)), 0.5). The lowering fuses it into
@@ -803,3 +802,11 @@ def gelu_case(name, x, swapped=False):
 
 gelu_case("gelu_erf_pattern", spiked(4, 64))
 gelu_case("gelu_erf_pattern_swapped", rand(3, 33), swapped=True)
+
+
+# An embedding lookup whose token ids are an int64 GRAPH INPUT (decide's input_ids): lowered to ggml_get_rows over int32 ids the executor
+# converts per run (native, multi-threaded, and on the device for the GPU plugins). Negative ids wrap, as in ONNX.
+case("gather_input_ids_embedding", "Gather", {"table": spiked(11, 6), "ids": np.array([[0, 3, 10, -1, 5], [7, -11, 2, 2, 9]], np.int64)},
+     nodes=[helper.make_node("Gather", ["table", "ids"], ["y"], axis=0)])
+
+print(len(os.listdir(OUT)) // 2, "cases in", os.path.normpath(OUT))

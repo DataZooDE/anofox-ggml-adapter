@@ -1342,6 +1342,14 @@ struct Compiled {
 	std::deque<FlatPlan> flat_plans;
 	std::deque<DoublePlan> double_plans;
 	std::deque<std::vector<int32_t>> index_storage;
+	//! Token ids a graph input carries into an embedding lookup (ggml_get_rows): converted from the call's floats into `ids` before every run,
+	//! negative ids wrapped and out-of-range ones refused (the table has `rows` rows).
+	struct IdInput {
+		std::string input, node;
+		std::vector<int32_t> *ids;
+		int64_t rows;
+	};
+	std::vector<IdInput> id_inputs;
 	std::vector<std::vector<float>> initializer_floats;
 	std::deque<std::vector<float>> folded;
 	std::vector<ggml_tensor *> node_outs;
@@ -2330,7 +2338,17 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 			const int64_t axis = normalised_axis(n.Attr("axis") ? n.Attr("axis")->i : 0, sh(0).size());
 			const auto idx_value = low.shapes.find(n.inputs.at(1));
 			const bool idx_known = idx_value != low.shapes.end() && idx_value->second.known && idx_value->second.dtype == ShapeDtype::I64;
-			if (!idx_known) {
+			if (!idx_known && axis == 0 && sh(0).size() == 2 && compiled->input_leaves.count(n.inputs.at(1)) != 0) {
+				// An embedding lookup with token ids straight from a graph input: ggml_get_rows over int32 ids the executor converts (and
+				// range-checks) per run. Native and multi-threaded, and on a device it stays there (a host kernel made the scheduler copy the
+				// whole table to the host on every run).
+				const int64_t count = compiled->input_leaves.at(n.inputs.at(1)).second;
+				index_storage.emplace_back(static_cast<size_t>(count), 0);
+				ggml_tensor *ids = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, count);
+				bind_external(ids, index_storage.back().data());
+				compiled->id_inputs.push_back({n.inputs.at(1), n.name, &index_storage.back(), sh(0)[0]});
+				out = low.Reshape(n, ggml_get_rows(ctx.get(), low.Dim0Contiguous(in(0)), ids), out_shape);
+			} else if (!idx_known) {
 				// indices computed from float data: held as exact floats, gathered by a host kernel
 				out = low.GatherDynamic(n, in(0), sh(0), in(1), axis, out_shape);
 			} else if (sh(0).size() > 4) {
@@ -2701,6 +2719,21 @@ HostTensors ExecuteCompiled(Compiled &c, const ExecutorRuntime &rt, const HostTe
 	}
 	for (ggml_tensor *view : c.input_views) {
 		view->data = static_cast<char *>(view->view_src->data) + view->view_offs; // follow the re-pointed leaf
+	}
+	for (const auto &id : c.id_inputs) { // token ids for the embedding lookups, checked before anything runs
+		const std::vector<float> &raw = inputs.at(id.input).data;
+		for (size_t i = 0; i < raw.size(); i++) {
+			const float r = raw[i];
+			int64_t v = std::isfinite(r) ? static_cast<int64_t>(r) : id.rows;
+			v += v < 0 ? id.rows : 0;
+			if (v < 0 || v >= id.rows || static_cast<float>(static_cast<int64_t>(r)) != r) {
+				char shown[32];
+				std::snprintf(shown, sizeof(shown), "%.9g", static_cast<double>(r)); // NaN/inf/fractions print as they are
+				throw std::runtime_error("ggml lowering: Gather '" + id.node + "': index " + shown + " (element " +
+				                         std::to_string(i) + " of input '" + id.input + "') is out of range for " + std::to_string(id.rows) + " rows");
+			}
+			(*id.ids)[i] = static_cast<int32_t>(v);
+		}
 	}
 	c.run_error.failed = false;
 	c.run_error.message.clear();
