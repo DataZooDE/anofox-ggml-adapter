@@ -801,9 +801,25 @@ Graph::Graph(const std::string &graph_path, const void *graph_data, size_t graph
 			if (!w->second.shape.empty() && w->second.shape != t.dims) {
 				Fail("the weight '" + t.name + "' was supplied with another shape than the graph declares");
 			}
-			if (w->second.dtype != t.data_type) {
+			const bool upcast = t.data_type == 1 && (w->second.dtype == 10 || w->second.dtype == 16);
+			if (w->second.dtype != t.data_type && !upcast) {
 				Fail("the weight '" + t.name + "' was supplied as ONNX type " + std::to_string(w->second.dtype) + ", the graph declares type " +
 				     std::to_string(t.data_type));
+			}
+			if (upcast) {
+				// A 16-bit checkpoint for a float32 graph (the host passes its mapped checkpoint instead of an upcast copy): converted
+				// once here, so the graph runs in float32 as declared.
+				mlx_stream cpu = mlx_default_cpu_stream_new();
+				Arr narrow = TensorArray(w->second.data, shape, w->second.dtype);
+				mlx_array wide = mlx_array_new();
+				const int st = mlx_astype(&wide, narrow.get(), MLX_FLOAT32, cpu);
+				mlx_stream_free(cpu);
+				if (st != 0 || mlx_array_eval(wide) != 0) {
+					mlx_array_free(wide);
+					Fail("could not convert the 16-bit weight '" + t.name + "' to float32");
+				}
+				impl_->initializers.emplace(t.name, Arr(wide));
+				continue;
 			}
 			bytes = w->second.data;
 		} else if (!t.raw.empty()) {
