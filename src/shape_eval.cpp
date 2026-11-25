@@ -338,6 +338,11 @@ ShapeValue TensorConstant(const ::anofox::onnxread::Tensor &t, const Node *node)
 		v.known = true;
 		return v;
 	}
+	if (static_cast<int64_t>(count) > kMaxKnownElements) {
+		// An inline weight of a full exported model: decoding it would cost twice its bytes on every compile, and nothing folds a tensor
+		// this large (every folding op refuses one above the cap); the lowering reads it in place.
+		return Unknown(shape, dt);
+	}
 	auto width_of = [](int32_t type) -> size_t {
 		switch (type) {
 		case 1:
@@ -1352,14 +1357,8 @@ std::vector<ShapeValue> EvaluateNode(const ::anofox::onnxread::Node &node, const
 
 ShapeEvalResult EvaluateShapes(const ::anofox::onnxread::Graph &graph, const ShapeEvalInput &input) {
 	Evaluator ev;
-	std::unordered_map<std::string, bool> is_input;
-	for (const auto &name : graph.inputs) {
-		is_input[name] = true;
-	}
 	for (const auto &t : graph.initializers) {
-		if (!is_input.count(t.name) || true) {
-			ev.values[t.name] = TensorConstant(t, nullptr);
-		}
+		ev.values[t.name] = TensorConstant(t, nullptr);
 	}
 	for (const auto &kv : input.shapes) {
 		const auto dt = input.dtypes.find(kv.first);
