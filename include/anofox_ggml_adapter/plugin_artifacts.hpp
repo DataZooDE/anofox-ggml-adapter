@@ -13,7 +13,7 @@ namespace ggml_adapter {
 //! The adapter release whose assets carry the built plugins. Bumped BY HAND before tagging: the plugin workflow refuses to attach plugins
 //! to a release whose tag is not this one, so a release always contains code that points at itself. A stale tag is safe: the loader
 //! refuses a plugin built against another ABI version.
-static constexpr const char *ANOFOX_GGML_PLUGIN_RELEASE_TAG = "v2026.11.24";
+static constexpr const char *ANOFOX_GGML_PLUGIN_RELEASE_TAG = "v2026.11.25";
 
 //! 'cuda', 'rocm', 'mlx' or an unknown name: lowercased; 'migraphx' (the removed MIGraphX plugin) is the ROCm plugin.
 inline std::string NormalizeBackend(const std::string &requested) {

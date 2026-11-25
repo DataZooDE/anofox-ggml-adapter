@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2026.11.25]
+
 ### Added
 - The ggml engine of anofox-tabfm as a shared component: the ONNX reader, the host shape pass, the lowering and executor, the op table and
   its per-op goldens. Namespace `anofox::ggml_adapter` (the reader stays `anofox::onnxread`). Environment switches are
