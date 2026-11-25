@@ -877,8 +877,12 @@ struct Lowering {
 	//! (ggml's CUDA small-batch kernel, at 16 rows or fewer, runs TF32 tensor-core instructions) and slices the extra zero rows off the result.
 	ggml_tensor *MulMat(ggml_tensor *weight, ggml_tensor *activations) {
 #if defined(__APPLE__) && defined(ANOFOX_GGML_ACCELERATE)
+		// Real matrix products only: Accelerate's matrix-vector kernels (one output column, or a single activation row) round differently
+		// depending on the activations' alignment, which differs between the plain and the scheduler path; every shape with at least two
+		// rows and two columns was bit-stable across alignments (measured on an M3). A vector product is memory-bound anyway.
+		const int64_t act_rows = activations->ne[1] * activations->ne[2] * activations->ne[3];
 		if (accelerate && weight->type == GGML_TYPE_F32 && activations->type == GGML_TYPE_F32 && weight->ne[2] == 1 && weight->ne[3] == 1 &&
-		    ggml_is_contiguous(weight)) {
+		    weight->ne[1] >= 2 && act_rows >= 2 && ggml_is_contiguous(weight)) {
 			ggml_tensor *a = Contiguous(activations);
 			ggml_tensor *args[2] = {weight, a};
 			ggml_tensor *t = ggml_custom_4d(ctx, GGML_TYPE_F32, weight->ne[1], a->ne[1], a->ne[2], a->ne[3], args, 2, AccelerateMulMatKernel, 1, nullptr);

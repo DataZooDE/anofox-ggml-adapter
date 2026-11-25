@@ -1231,3 +1231,39 @@ TEST_CASE("ggml_executor: a graph planned before the shared arena grew runs on t
 		REQUIRE(std::fabs(out.at("y").data.back() - want) < 1e-5f);
 	}
 }
+
+TEST_CASE("ggml_lowering: on Apple builds a weight matmul runs on Accelerate only when it is a real matrix product", "[adapter][ggml][ggml_ops][accelerate]") {
+	// Accelerate's matrix-vector kernels (one output column, or one activation row against 32+ columns) round differently depending on
+	// the activations' alignment, so the scheduler path and the plain path disagreed in the last bit (anofox-tabfm, mitra). Every shape
+	// with at least two rows and two columns was bit-stable across alignments on an M3: only those go to Accelerate.
+	auto ops_for = [](int64_t rows, int64_t cols) {
+		::anofox::onnxread::Graph g;
+		g.inputs = {"x"};
+		::anofox::onnxread::Tensor w;
+		w.name = "w";
+		w.dims = {64, cols};
+		w.data_type = 1;
+		std::vector<float> wv(static_cast<size_t>(64 * cols), 0.5f);
+		w.raw.assign(reinterpret_cast<const char *>(wv.data()), wv.size() * sizeof(float));
+		g.initializers.push_back(w);
+		g.nodes = {MakeNode("MatMul", {"x", "w"}, "y")};
+		g.outputs = {"y"};
+		HostTensors in;
+		in["x"] = HostTensor {{rows, 64}, std::vector<float>(static_cast<size_t>(rows * 64), 1.0f)};
+		GgmlExecutorConfig config;
+		config.threads = 2;
+		GgmlExecutor executor(g, config);
+		const auto ops = executor.GraphOpCounts(in, GgmlRunOptions {});
+		const auto out = executor.Run(in, GgmlRunOptions {});
+		REQUIRE(out.at("y").data[0] == 32.0f);
+		return std::make_pair(ops.count("CUSTOM") ? ops.at("CUSTOM") : 0, ops.count("MUL_MAT") ? ops.at("MUL_MAT") : 0);
+	};
+#if defined(__APPLE__) && defined(ANOFOX_GGML_ACCELERATE)
+	const int accelerated = 1;
+#else
+	const int accelerated = 0;
+#endif
+	REQUIRE(ops_for(8, 16) == std::make_pair(accelerated, 1 - accelerated)); // a matrix product
+	REQUIRE(ops_for(8, 1) == std::make_pair(0, 1));                            // one output column: matrix-vector
+	REQUIRE(ops_for(1, 64) == std::make_pair(0, 1));                           // one activation row: vector-matrix
+}
