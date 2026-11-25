@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Changed
+- MLX plugin: shape arithmetic (nodes whose operands are all small integer or boolean tensors) and the integer read-backs of Reshape,
+  Slice, Expand and the like run on MLX's CPU stream. On the GPU stream each read-back waited for every layer kernel queued before it;
+  on an M3 that was ~58% of the plugin's time. decide's 400-call julia-1 run: 24.5 s -> 11.0 s, results bit-identical.
+
 ## [2026.11.25]
 
 ### Added
