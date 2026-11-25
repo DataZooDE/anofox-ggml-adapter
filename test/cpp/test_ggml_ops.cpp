@@ -1125,3 +1125,52 @@ TEST_CASE("ggml_executor: one activation arena serves every cached shape, sized 
 	REQUIRE(executor.CompileCount() == 3);
 	REQUIRE(executor.ActivationBytes() == large_alone);
 }
+
+TEST_CASE("ggml_executor: on a device, a float32 initializer takes 16-bit data and inline weights are uploaded once", "[adapter][ggml][ggml_ops][device_weights]") {
+	// A host's 16-bit checkpoint for a float32 graph (decide's Laya models on a GPU): the device upload upcasts it.
+	const std::vector<uint16_t> f16 = {0x3C00, 0x4000, 0x4200, 0x4400, 0x4500, 0x4600}; // 1..6
+	::anofox::onnxread::Graph g;
+	g.inputs = {"x"};
+	::anofox::onnxread::Tensor t;
+	t.name = "w";
+	t.dims = {3, 2};
+	t.data_type = 1;
+	t.location = ::anofox::onnxread::DataLocation::EXTERNAL;
+	g.initializers.push_back(t);
+	g.nodes = {MakeNode("MatMul", {"x", "w"}, "y")};
+	g.outputs = {"y"};
+	HostTensors in;
+	in["x"] = {{2, 3}, {1.0f, 0.5f, -1.0f, 2.0f, 0.0f, 3.0f}};
+	GgmlExecutorConfig config;
+	config.threads = 2;
+	config.device = "cpu-sched";
+	config.weights = [&](const std::string &, const std::vector<int64_t> &) { return ExternalWeight {reinterpret_cast<const float *>(f16.data()), 6, 10}; };
+	GgmlExecutor executor(g, config);
+	const auto out = executor.Run(in, GgmlRunOptions());
+	REQUIRE(out.at("y").data == std::vector<float> {1.0f * 1 + 0.5f * 3 - 1.0f * 5, 1.0f * 2 + 0.5f * 4 - 1.0f * 6, 2.0f * 1 + 3.0f * 5, 2.0f * 2 + 3.0f * 6});
+
+	// A registered full graph keeps its weights inline: on a device they were re-uploaded with every run (the whole model per call).
+	::anofox::onnxread::Graph full;
+	full.inputs = {"x"};
+	::anofox::onnxread::Tensor w;
+	w.name = "w";
+	w.dims = {256, 256};
+	w.data_type = 1;
+	std::vector<float> wv(256 * 256, 0.01f);
+	w.raw.assign(reinterpret_cast<const char *>(wv.data()), wv.size() * sizeof(float));
+	full.initializers.push_back(w);
+	full.nodes = {MakeNode("MatMul", {"x", "w"}, "y")};
+	full.outputs = {"y"};
+	GgmlExecutorConfig device;
+	device.threads = 2;
+	device.device = "cpu-sched";
+	GgmlExecutor inline_executor(full, device);
+	HostTensors xin;
+	xin["x"] = {{4, 256}, std::vector<float>(4 * 256, 1.0f)};
+	inline_executor.Run(xin, GgmlRunOptions());
+	const size_t after_first = inline_executor.UploadedBytes();
+	REQUIRE(after_first >= wv.size() * sizeof(float));
+	inline_executor.Run(xin, GgmlRunOptions());
+	inline_executor.Run(xin, GgmlRunOptions());
+	REQUIRE(inline_executor.UploadedBytes() - after_first == 2 * 4 * 256 * sizeof(float)); // later runs move only the input
+}

@@ -1643,7 +1643,9 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 				throw std::runtime_error("ggml lowering: weight '" + t.name + "' has " + std::to_string(external.count) + " values for a shape of " +
 				                         std::to_string(count));
 			}
-			if (external.onnx_type != t.data_type) {
+			// a device upload upcasts 16-bit data, so a float32 initializer may take a host's 16-bit checkpoint as it is
+			const bool device_upcast = provider && t.data_type == 1 && (external.onnx_type == 10 || external.onnx_type == 16);
+			if (external.onnx_type != t.data_type && !device_upcast) {
 				throw std::runtime_error("ggml lowering: weight '" + t.name + "' is declared as ONNX type " + std::to_string(t.data_type) + " but was supplied as type " +
 				                         std::to_string(external.onnx_type));
 			}
@@ -1659,6 +1661,22 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 				                         " (bf16/fp16); only a device executor upcasts those on upload (the CPU session upcasts while injecting)");
 			}
 			leaf(t.name, Shape(t.dims.begin(), t.dims.end()), external.data);
+			return;
+		}
+		if (provider && t.data_type == 1 && count > 1 && (!t.raw.empty() ? t.raw.size() >= count * 4 : t.floats.size() >= count)) {
+			// A device: an inline float32 weight (a registered full graph carries all of them) becomes a persistent device weight, uploaded
+			// once for the executor. As a per-run upload leaf it was copied to the device again on every run: the whole model per call.
+			Node pseudo;
+			pseudo.name = t.name;
+			pseudo.op_type = "<weight>";
+			std::vector<float> aligned;
+			const float *host = !t.raw.empty() ? reinterpret_cast<const float *>(t.raw.data()) : t.floats.data();
+			if (!t.raw.empty() && reinterpret_cast<uintptr_t>(t.raw.data()) % alignof(float) != 0) {
+				aligned.resize(count);
+				std::memcpy(aligned.data(), t.raw.data(), count * 4);
+				host = aligned.data();
+			}
+			low.tensors[t.name] = provider(t.name, ToStorage(pseudo, Shape(t.dims.begin(), t.dims.end())), host, 1);
 			return;
 		}
 		if (t.data_type == 1 && !t.raw.empty() && t.raw.size() >= count * 4 && reinterpret_cast<uintptr_t>(t.raw.data()) % alignof(float) == 0) {
@@ -2693,6 +2711,7 @@ struct ExecutorRuntime {
 	ggml_backend_t cpu = nullptr;                    // always present; runs the custom kernels and, for device "cpu", everything
 	SharedArena *arena = nullptr;                    // the executor's (see SharedArena)
 	std::string out_of_memory_remedy;                // the host's advice (GgmlExecutorConfig), appended to a device out-of-memory error
+	size_t *uploaded_bytes = nullptr;                // the executor's count of bytes copied to the device (UploadedBytes)
 	ggml_threadpool_t pool = nullptr;
 	int threads = 1;
 	std::vector<ggml_backend_t> sched_backends;      // scheduler path: the device first, the CPU last (empty = plain CPU path)
@@ -2868,6 +2887,9 @@ HostTensors ExecuteCompiled(Compiled &c, const ExecutorRuntime &rt, const HostTe
 			}
 			const void *host = u.input_name.empty() ? u.host : inputs.at(u.input_name).data.data();
 			ggml_backend_tensor_set(u.tensor, host, 0, ggml_nbytes(u.tensor));
+			if (rt.uploaded_bytes) {
+				*rt.uploaded_bytes += ggml_nbytes(u.tensor);
+			}
 		}
 		clock.Lap("upload");
 		ggml_status status;
@@ -2939,6 +2961,7 @@ struct GgmlExecutor::Impl {
 	std::list<std::unique_ptr<Compiled>> cache; // most recently used first
 	size_t compiles = 0;
 	SharedArena arena; // the plain CPU path's activations, shared by every cached graph
+	size_t uploaded_bytes = 0; // copied to the device so far (UploadedBytes)
 
 	Impl(const ::anofox::onnxread::Graph &graph_p, GgmlExecutorConfig config_p) : graph(graph_p), config(std::move(config_p)) {
 		try {
@@ -2982,6 +3005,7 @@ struct GgmlExecutor::Impl {
 		runtime.cpu = cpu.get();
 		runtime.arena = &arena;
 		runtime.out_of_memory_remedy = config.out_of_memory_remedy;
+		runtime.uploaded_bytes = &uploaded_bytes;
 		runtime.pool = pool;
 		runtime.threads = config.threads;
 		if (config.device == "cpu") {
@@ -3076,6 +3100,7 @@ struct GgmlExecutor::Impl {
 			}
 		}
 		weights_on_device[name] = t;
+		uploaded_bytes += ggml_nbytes(t);
 		return t;
 	}
 
@@ -3253,6 +3278,11 @@ void GgmlExecutor::Trim() {
 	std::lock_guard<std::mutex> guard(impl_->mutex);
 	impl_->cache.clear();
 	impl_->arena = SharedArena {}; // and their activation memory
+}
+
+size_t GgmlExecutor::UploadedBytes() const {
+	std::lock_guard<std::mutex> guard(impl_->mutex);
+	return impl_->uploaded_bytes;
 }
 
 size_t GgmlExecutor::ActivationBytes() const {
