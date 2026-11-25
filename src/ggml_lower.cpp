@@ -788,7 +788,10 @@ struct Lowering {
 			axis[r - 1 - perm[j]] = static_cast<int>(r - 1 - j);
 		}
 		ggml_tensor *view = ggml_permute(ctx, x, axis[0], axis[1], axis[2], axis[3]);
-		ggml_tensor *copy = ggml_is_contiguous(view) ? view : ggml_cont(ctx, view); // a permutation that undoes a view's needs no copy
+		// A permutation that undoes a view's needs no copy. ggml_is_contiguous skips size-1 dimensions, so a view whose first dimension is a
+		// moved size-1 axis passes it with a first stride other than the element size, which a later strided view cannot take: copied.
+		const bool in_order = ggml_is_contiguous(view) && view->nb[0] == ggml_type_size(view->type);
+		ggml_tensor *copy = in_order ? view : ggml_cont(ctx, view);
 		// Remember a swap of the last two dimensions (a weight's Transpose, attention's K^T): MatMul wants the operand in exactly the layout
 		// the transpose started from, so it can read the original instead of transposing the copy back.
 		bool swaps_last_two = r >= 2;

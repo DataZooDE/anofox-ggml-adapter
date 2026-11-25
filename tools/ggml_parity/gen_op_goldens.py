@@ -809,4 +809,11 @@ gelu_case("gelu_erf_pattern_swapped", rand(3, 33), swapped=True)
 case("gather_input_ids_embedding", "Gather", {"table": spiked(11, 6), "ids": np.array([[0, 3, 10, -1, 5], [7, -11, 2, 2, 9]], np.int64)},
      nodes=[helper.make_node("Gather", ["table", "ids"], ["y"], axis=0)])
 
+# A Transpose that moves a size-1 axis to the front, then a Slice: ggml calls such a permuted view contiguous (size-1 strides are not
+# checked) although its first stride is not the element size, and a strided view of it is invalid. The lowering must copy it.
+case("transpose_unit_axis_then_slice", "Slice", {"x": spiked(3, 1, 4)}, nodes=[
+    helper.make_node("Transpose", ["x"], ["t"], perm=[0, 2, 1]),
+    helper.make_node("Slice", ["t", "starts", "ends", "axes"], ["y"])],
+    inits={"starts": ax(1), "ends": ax(3), "axes": ax(1)})
+
 print(len(os.listdir(OUT)) // 2, "cases in", os.path.normpath(OUT))
