@@ -107,80 +107,94 @@ bool SameNe(const ggml_tensor *t, const Ne4 &ne) {
 enum CustomOp : intptr_t { C_EQ, C_LT, C_LE, C_GT, C_GE, C_WHERE, C_ISNAN, C_ISINF_BOTH, C_ISINF_POS, C_ISINF_NEG,
 	               C_ERF, C_ROUND, C_RECIP, C_POW, C_MAX, C_MIN, C_MOD, C_CLIP_BOTH, C_CLIP_MIN, C_CLIP_MAX, C_SIGN, C_RELU, C_NEQ0, C_TRUNC, C_MODFLOOR, C_F16 };
 
+//! One elementwise op over a row: operand k is read at row_k[i * step_k] (step 0 broadcasts it along the row). Each op is its own instantiation
+//! of the loop, so the switch runs once per row, not per element, and the all-contiguous case (every step 1) vectorises.
+template <class F>
+inline void ElementwiseRow(float *out, int64_t n, const float *a, int64_t sa, const float *b, int64_t sb, const float *c, int64_t sc, F f) {
+	if (sa == 1 && (sb == 1 || !b) && (sc == 1 || !c)) {
+		for (int64_t i = 0; i < n; i++) {
+			out[i] = f(a[i], b ? b[i] : 0.0f, c ? c[i] : 0.0f);
+		}
+		return;
+	}
+	for (int64_t i = 0; i < n; i++) {
+		out[i] = f(a[i * sa], b ? b[i * sb] : 0.0f, c ? c[i * sc] : 0.0f);
+	}
+}
+
 void ElementwiseKernel(ggml_tensor *dst, int ith, int nth, void *userdata) {
 	const auto op = static_cast<CustomOp>(reinterpret_cast<intptr_t>(userdata));
 	const ggml_tensor *s0 = dst->src[0], *s1 = dst->src[1], *s2 = dst->src[2];
-	auto at = [&](const ggml_tensor *t, int64_t i0, int64_t i1, int64_t i2, int64_t i3) {
-		const char *p = static_cast<const char *>(t->data) + (t->ne[0] == 1 ? 0 : i0 * t->nb[0]) +
-		                (t->ne[1] == 1 ? 0 : i1 * t->nb[1]) + (t->ne[2] == 1 ? 0 : i2 * t->nb[2]) +
-		                (t->ne[3] == 1 ? 0 : i3 * t->nb[3]);
-		return *reinterpret_cast<const float *>(p);
+	// the start of row (i1, i2, i3) of an operand (a broadcast dimension stays at 0) and its element step along ne0 (Dim0Contiguous operands)
+	auto row_of = [](const ggml_tensor *t, int64_t i1, int64_t i2, int64_t i3, int64_t &step) -> const float * {
+		if (!t) {
+			step = 0;
+			return nullptr;
+		}
+		step = t->ne[0] == 1 ? 0 : 1;
+		return reinterpret_cast<const float *>(static_cast<const char *>(t->data) + (t->ne[1] == 1 ? 0 : i1 * t->nb[1]) +
+		                                       (t->ne[2] == 1 ? 0 : i2 * t->nb[2]) + (t->ne[3] == 1 ? 0 : i3 * t->nb[3]));
 	};
 	// Rows are independent: thread `ith` of `nth` takes every nth row.
-	const int64_t rows = dst->ne[1] * dst->ne[2] * dst->ne[3];
+	const int64_t rows = dst->ne[1] * dst->ne[2] * dst->ne[3], n = dst->ne[0];
 	for (int64_t row_index = ith; row_index < rows; row_index += nth) {
-		{
-			const int64_t i1 = row_index % dst->ne[1], i2 = (row_index / dst->ne[1]) % dst->ne[2], i3 = row_index / (dst->ne[1] * dst->ne[2]);
-			{
-				float *row = reinterpret_cast<float *>(static_cast<char *>(dst->data) + i3 * dst->nb[3] + i2 * dst->nb[2] + i1 * dst->nb[1]);
-				for (int64_t i0 = 0; i0 < dst->ne[0]; i0++) {
-					const float a = at(s0, i0, i1, i2, i3);
-					float r = 0.0f;
-					switch (op) {
-					case C_EQ: r = a == at(s1, i0, i1, i2, i3); break;
-					case C_LT: r = a < at(s1, i0, i1, i2, i3); break;
-					case C_LE: r = a <= at(s1, i0, i1, i2, i3); break;
-					case C_GT: r = a > at(s1, i0, i1, i2, i3); break;
-					case C_GE: r = a >= at(s1, i0, i1, i2, i3); break;
-					case C_WHERE: r = a != 0.0f ? at(s1, i0, i1, i2, i3) : at(s2, i0, i1, i2, i3); break;
-					case C_ISNAN: r = std::isnan(a); break;
-					case C_ISINF_BOTH: r = std::isinf(a); break;
-					case C_ISINF_POS: r = std::isinf(a) && a > 0; break;
-					case C_ISINF_NEG: r = std::isinf(a) && a < 0; break;
-					case C_SIGN: r = std::isnan(a) ? a : static_cast<float>((a > 0) - (a < 0)); break; // ggml_sgn turns NaN into 0
-					case C_TRUNC: r = std::trunc(a) + 0.0f; break; /* +0.0f: an integer has no -0 */ // Cast float -> int: toward zero; the integer lives on as an exact float
-					case C_F16: r = RoundToHalf(a); break; // Cast to FLOAT16: rounded to half precision, carried as float32
-					case C_NEQ0: r = a != 0.0f; break; // Cast to bool: NaN is true, like ORT
-					case C_RELU: r = a < 0.0f ? 0.0f : a; break; // NaN passes (ggml_relu maps it to 0)
-					case C_ERF: r = std::erf(a); break;
-					case C_ROUND: r = std::nearbyint(a); break; // ONNX Round is half to even
-					case C_RECIP: r = 1.0f / a; break;
-					case C_POW: r = std::pow(a, at(s1, i0, i1, i2, i3)); break;
-					case C_MAX:
-					case C_MIN: {
-						const float b = at(s1, i0, i1, i2, i3);
-						r = (std::isnan(a) || std::isnan(b)) ? std::nanf("") : (op == C_MAX ? std::max(a, b) : std::min(a, b));
-						break;
-					}
-					case C_MODFLOOR: { // integer Mod with fmod=0: the result takes the sign of the divisor
-						const float b = at(s1, i0, i1, i2, i3);
-						float m = std::fmod(a, b);
-						if (m != 0.0f && ((m < 0.0f) != (b < 0.0f))) {
-							m += b;
-						}
-						r = m + 0.0f;
-						break;
-					}
-					case C_MOD: r = std::fmod(a, at(s1, i0, i1, i2, i3)); break;
-					case C_CLIP_BOTH:
-					case C_CLIP_MIN:
-					case C_CLIP_MAX: {
-						// NaN passes through (both comparisons are false); a missing bound is +-FLT_MAX like ORT, so it also clamps +-inf
-						const float lo = op == C_CLIP_MAX ? -FLT_MAX : at(s1, i0, i1, i2, i3);
-						const float hi = op == C_CLIP_MIN ? FLT_MAX : at(op == C_CLIP_MAX ? s1 : s2, i0, i1, i2, i3);
-						r = a;
-						if (r < lo) {
-							r = lo;
-						}
-						if (r > hi) {
-							r = hi; // min(max(x, lo), hi): with lo > hi the result is hi, like ORT
-						}
-						break;
-					}
-					}
-					row[i0] = r;
+		const int64_t i1 = row_index % dst->ne[1], i2 = (row_index / dst->ne[1]) % dst->ne[2], i3 = row_index / (dst->ne[1] * dst->ne[2]);
+		float *out = reinterpret_cast<float *>(static_cast<char *>(dst->data) + i3 * dst->nb[3] + i2 * dst->nb[2] + i1 * dst->nb[1]);
+		int64_t sa, sb, sc;
+		const float *a = row_of(s0, i1, i2, i3, sa), *b = row_of(s1, i1, i2, i3, sb), *c = row_of(s2, i1, i2, i3, sc);
+		auto run = [&](auto f) { ElementwiseRow(out, n, a, sa, b, sb, c, sc, f); };
+		switch (op) {
+		case C_EQ: run([](float x, float y, float) { return static_cast<float>(x == y); }); break;
+		case C_LT: run([](float x, float y, float) { return static_cast<float>(x < y); }); break;
+		case C_LE: run([](float x, float y, float) { return static_cast<float>(x <= y); }); break;
+		case C_GT: run([](float x, float y, float) { return static_cast<float>(x > y); }); break;
+		case C_GE: run([](float x, float y, float) { return static_cast<float>(x >= y); }); break;
+		case C_WHERE: run([](float x, float y, float z) { return x != 0.0f ? y : z; }); break;
+		case C_ISNAN: run([](float x, float, float) { return static_cast<float>(std::isnan(x)); }); break;
+		case C_ISINF_BOTH: run([](float x, float, float) { return static_cast<float>(std::isinf(x)); }); break;
+		case C_ISINF_POS: run([](float x, float, float) { return static_cast<float>(std::isinf(x) && x > 0); }); break;
+		case C_ISINF_NEG: run([](float x, float, float) { return static_cast<float>(std::isinf(x) && x < 0); }); break;
+		case C_SIGN: run([](float x, float, float) { return std::isnan(x) ? x : static_cast<float>((x > 0) - (x < 0)); }); break; // ggml_sgn turns NaN into 0
+		case C_TRUNC: run([](float x, float, float) { return std::trunc(x) + 0.0f; }); break; // +0.0f: an integer has no -0 (Cast float -> int, toward zero)
+		case C_F16: run([](float x, float, float) { return RoundToHalf(x); }); break; // Cast to FLOAT16: rounded to half precision, carried as float32
+		case C_NEQ0: run([](float x, float, float) { return static_cast<float>(x != 0.0f); }); break; // Cast to bool: NaN is true, like ORT
+		case C_RELU: run([](float x, float, float) { return x < 0.0f ? 0.0f : x; }); break; // NaN passes (ggml_relu maps it to 0)
+		case C_ERF: run([](float x, float, float) { return std::erf(x); }); break;
+		case C_ROUND: run([](float x, float, float) { return std::nearbyint(x); }); break; // ONNX Round is half to even
+		case C_RECIP: run([](float x, float, float) { return 1.0f / x; }); break;
+		case C_POW: run([](float x, float y, float) { return std::pow(x, y); }); break;
+		case C_MAX: run([](float x, float y, float) { return (std::isnan(x) || std::isnan(y)) ? std::nanf("") : std::max(x, y); }); break;
+		case C_MIN: run([](float x, float y, float) { return (std::isnan(x) || std::isnan(y)) ? std::nanf("") : std::min(x, y); }); break;
+		case C_MODFLOOR: // integer Mod with fmod=0: the result takes the sign of the divisor
+			run([](float x, float y, float) {
+				float m = std::fmod(x, y);
+				if (m != 0.0f && ((m < 0.0f) != (y < 0.0f))) {
+					m += y;
 				}
-			}
+				return m + 0.0f;
+			});
+			break;
+		case C_MOD: run([](float x, float y, float) { return std::fmod(x, y); }); break;
+		// Clip: NaN passes through (both comparisons are false); a missing bound is +-FLT_MAX like ORT, so it also clamps +-inf;
+		// min(max(x, lo), hi): with lo > hi the result is hi, like ORT
+		case C_CLIP_BOTH:
+			run([](float x, float lo, float hi) {
+				float r = x < lo ? lo : x;
+				return r > hi ? hi : r;
+			});
+			break;
+		case C_CLIP_MIN: // hi = FLT_MAX
+			run([](float x, float lo, float) {
+				float r = x < lo ? lo : x;
+				return r > FLT_MAX ? FLT_MAX : r;
+			});
+			break;
+		case C_CLIP_MAX: // lo = -FLT_MAX
+			run([](float x, float hi, float) {
+				float r = x < -FLT_MAX ? -FLT_MAX : x;
+				return r > hi ? hi : r;
+			});
+			break;
 		}
 	}
 }
