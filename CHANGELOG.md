@@ -6,6 +6,9 @@
 - MLX plugin: shape arithmetic (nodes whose operands are all small integer or boolean tensors) and the integer read-backs of Reshape,
   Slice, Expand and the like run on MLX's CPU stream. On the GPU stream each read-back waited for every layer kernel queued before it;
   on an M3 that was ~58% of the plugin's time. decide's 400-call julia-1 run: 24.5 s -> 11.0 s, results bit-identical.
+- MLX plugin: 16-bit weights for a float32 graph are widened on the GPU stream (not the CPU), and MLX's buffer cache is released after
+  load and after each run. Laya typed-decisions on an M3: resident set 1.87 -> 0.40 GB, physical footprint 2.19 -> 1.77 GB, no change
+  in speed.
 
 ## [2026.11.25]
 
