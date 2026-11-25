@@ -1838,14 +1838,23 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 		}
 		ggml_context *c = ctx.get();
 		auto rows_contiguous = [&](ggml_tensor *t) { return t->nb[0] == ggml_type_size(t->type) ? t : ggml_cont(c, t); };
+		// ggml runs a different flash-attention kernel by query count (one row: split-KV; under 64: per row; from 64: tiled), and they sum in
+		// different orders: a row's result would depend on how many rows share the batch (TabFM answers query rows against a fixed context
+		// and promises the same answer however they are batched). Queries are padded with zero rows to the tiled kernel's 64 (ggml-cpu's
+		// GGML_FA_TILE_Q), so the tiled kernel always runs; the padding rows are sliced off.
+		constexpr int64_t kTiledRows = 64;
+		const int64_t SQ = std::max(S, kTiledRows);
 		ggml_tensor *q = rows_contiguous(tensor_of(n, qn));                                          // ne [D, S, H, B]
+		if (SQ != S) {
+			q = ggml_pad(c, low.Contiguous(q), 0, static_cast<int>(SQ - S), 0, 0);                  // ne [D, SQ, H, B], zero rows at the end
+		}
 		ggml_tensor *k = rows_contiguous(ggml_transpose(c, tensor_of(n, ktn)));                     // kT [SK, D, H, B] -> [D, SK, H, B]
 		ggml_tensor *v = rows_contiguous(tensor_of(n, vn));                                          // ne [Dv, SK, H, B]
 		ggml_tensor *m16 = nullptr;
 		if (!mask.empty()) {
 			// The kernel reads one mask row per query row (no broadcast over queries), so a key-padding mask is repeated to S rows: the
 			// float16 copy depends on S, and attentions over the same mask with other query lengths need their own.
-			const std::string key = mask + "#" + std::to_string(S);
+			const std::string key = mask + "#" + std::to_string(SQ);
 			auto cached = f16_masks.find(key);
 			if (cached != f16_masks.end()) {
 				m16 = cached->second;
@@ -1853,13 +1862,19 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 				ggml_tensor *m = low.Contiguous(tensor_of(n, mask));
 				m = ggml_reshape_4d(c, m, SK, ms[2], ms[1], ms[0]);
 				if (ms[2] != S) {
-					m = ggml_repeat(c, m, ggml_new_tensor_4d(c, GGML_TYPE_F32, SK, S, ms[1], ms[0]));
+					// one mask row for every query: repeated to all SQ rows (the cached copy is the same for any S that pads to SQ)
+					m = ggml_repeat(c, m, ggml_new_tensor_4d(c, GGML_TYPE_F32, SK, SQ, ms[1], ms[0]));
+				} else if (SQ != S) {
+					m = ggml_pad(c, m, 0, static_cast<int>(SQ - S), 0, 0); // a mask row per query: the padding rows see every key (dropped)
 				}
 				m16 = ggml_cast(c, m, GGML_TYPE_F16);
 				f16_masks[key] = m16;
 			}
 		}
 		ggml_tensor *fa = ggml_flash_attn_ext(c, q, k, v, m16, static_cast<float>(scale), 0.0f, 0.0f);
+		if (SQ != S) {
+			fa = ggml_view_4d(c, fa, fa->ne[0], fa->ne[1], S, fa->ne[3], fa->nb[1], fa->nb[2], fa->nb[3], 0); // [Dv, H, SQ, B] -> the first S rows
+		}
 		return ggml_permute(c, fa, 0, 2, 1, 3); // [Dv, H, S, B] -> the MatMul's [Dv, S, H, B]
 	};
 

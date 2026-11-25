@@ -975,3 +975,51 @@ TEST_CASE("ggml_lowering: a fully masked query row gives finite values under the
 		REQUIRE(SameFloat(y.data[i], want.data[i], true));
 	}
 }
+
+TEST_CASE("ggml_lowering: a fused attention row does not depend on how many query rows share the batch", "[adapter][ggml][ggml_ops][attention]") {
+	// TabFM-style models answer query rows against a fixed context: a row's answer must be the same, bit for bit, whether it is scored
+	// alone, with 19 others or with 99 others. ggml picks a different flash-attention kernel by query count (one row: split-KV; under 64:
+	// per row; from 64: tiled), and the kernels sum in different orders, so the lowering pins one kernel.
+	const std::string stem = "test/fixtures/ggml_ops/sdpa_single_query_split_kv"; // q [1, 2, S, 4] against 600 keys, key mask [1, 1, 1, 600]
+	const Case c = ReadCase(stem);
+	const auto graph = ReadGraph(stem);
+	const HostTensor &q1 = c.inputs.at("q");
+	auto with_rows = [&](int64_t rows) {
+		HostTensors in = c.inputs;
+		HostTensor q;
+		q.shape = {1, 2, rows, 4};
+		for (int64_t h = 0; h < 2; h++) {
+			for (int64_t r = 0; r < rows; r++) {
+				for (int64_t d = 0; d < 4; d++) {
+					// row 0 is the golden's own query row; the others are distinct values
+					q.data.push_back(r == 0 ? q1.data[static_cast<size_t>(h * 4 + d)] : 0.01f * static_cast<float>((r * 7 + d * 3 + h) % 97) - 0.4f);
+				}
+			}
+		}
+		in["q"] = q;
+		return in;
+	};
+	std::vector<std::vector<float>> row0; // [head 0 row 0, head 1 row 0] per batch size
+	for (int64_t rows : {1, 20, 100}) {
+		INFO("query rows " << rows);
+		GgmlExecutorConfig config;
+		config.threads = 3;
+		GgmlExecutor executor(graph, config);
+		REQUIRE(executor.GraphOpCounts(with_rows(rows), GgmlRunOptions {}).count("FLASH_ATTN_EXT") == 1);
+		const auto out = executor.Run(with_rows(rows), GgmlRunOptions {});
+		const HostTensor &y = out.at("y"); // [1, 2, rows, 4]
+		std::vector<float> r0;
+		for (int64_t h = 0; h < 2; h++) {
+			for (int64_t d = 0; d < 4; d++) {
+				r0.push_back(y.data[static_cast<size_t>((h * rows) * 4 + d)]);
+			}
+		}
+		row0.push_back(r0);
+	}
+	for (size_t b = 1; b < row0.size(); b++) {
+		for (size_t i = 0; i < row0[0].size(); i++) {
+			INFO("batch " << b << " element " << i << ": " << row0[b][i] << " vs " << row0[0][i]);
+			REQUIRE(SameBits(row0[b][i], row0[0][i]));
+		}
+	}
+}
