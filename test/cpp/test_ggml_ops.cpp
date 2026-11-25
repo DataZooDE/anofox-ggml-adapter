@@ -922,7 +922,7 @@ TEST_CASE("ggml_executor: inline float weights are read in place, not copied per
 // Attention at long texts: the unfused lowering materialises the [heads, S, S] scores and runs four passes over them (QK^T, scale, mask,
 // softmax) before PV. The CPU lowering recognises the exported pattern and emits one ggml_flash_attn_ext (the goldens above hold it to
 // ORT's unfused kernels). It fuses only a 0/-max mask from Where (an F16 mask would round a real-valued bias), and only on ggml's CPU
-// backend ("cpu" and the scheduler path "cpu-sched"): a GPU device keeps the lowering its plugins were verified with.
+// backend ("cpu" and the scheduler path "cpu-sched") and on a GPU that supports the op (checked on the hardware runs).
 TEST_CASE("ggml_lowering: scaled-dot-product attention fuses into one flash attention on the CPU", "[adapter][ggml][ggml_ops][attention]") {
 	struct Want {
 		const char *stem;

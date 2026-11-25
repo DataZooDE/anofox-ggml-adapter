@@ -22,8 +22,8 @@
 ### Changed
 - Attention is fused on the CPU: the exported scaled-dot-product pattern (`MatMul(q, kT)`, an optional scalar scale, an optional
   `Where(keep, 0, -max)` mask, `Softmax` over the last axis, float casts, `MatMul(., v)`) lowers to one `ggml_flash_attn_ext`
-  instead of materialising the `[B, H, S, S]` scores. A real-valued additive bias, broadcast batch/head dimensions and the device
-  path (the GPU plugins) keep the unfused lowering. A query row with every key masked (padding) now gives 0 instead of ORT's
+  instead of materialising the `[B, H, S, S]` scores, on the CPU and on a GPU whose backend supports the op. A real-valued additive
+  bias and broadcast batch/head dimensions keep the unfused lowering. A query row with every key masked (padding) now gives 0 instead of ORT's
   uniform average. `GgmlExecutor::GraphOpCounts()` reports the ops of a compiled graph (a test hook).
   A query row's result does not depend on how many rows share the batch: fewer than 64 query rows are padded to the
   tiled kernel's 64 (ggml picks its flash-attention kernel by row count, and the kernels sum in different orders).
