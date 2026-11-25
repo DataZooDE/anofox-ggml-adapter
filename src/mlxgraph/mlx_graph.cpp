@@ -128,7 +128,16 @@ Arr Contiguous(const Arr &a, mlx_stream s) {
 //! evaluating a GPU-produced array through an unrelated stream is how
 //! mlx_array_data_int64 comes back null -- which surfaces as the misleading
 //! "expected an integer tensor" rather than as a stream error.
-std::vector<int64_t> ToInts(const Arr &a, mlx_stream s) {
+//! The calling thread's CPU stream (MLX default streams are thread-local; one handle per thread, kept for the thread's life).
+mlx_stream HostStream() {
+	static thread_local mlx_stream cpu = mlx_default_cpu_stream_new();
+	return cpu;
+}
+
+std::vector<int64_t> ToInts(const Arr &a, mlx_stream /*s*/) {
+	// Read on the CPU stream: on the GPU stream the read waited for every kernel queued before it (the matmuls of the layers so far),
+	// although a shape or an index is usually computed from host-known values. MLX still waits when `a` was produced on the GPU.
+	const mlx_stream s = HostStream();
 	Arr cast;
 	Ok(mlx_astype(cast.out(), a.get(), MLX_INT64, s), "astype int64");
 	Arr i64 = Contiguous(cast, s);

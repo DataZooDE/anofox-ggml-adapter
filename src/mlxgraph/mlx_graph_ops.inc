@@ -1069,9 +1069,25 @@ std::map<std::string, Tensor> Graph::Run(const std::vector<std::pair<std::string
 			auto init = impl_->initializers.find(in);
 			args.push_back(init == impl_->initializers.end() ? nullptr : &init->second);
 		}
+		// Shape arithmetic (every operand a small integer or boolean tensor: Shape -> Gather -> Concat -> Reshape's shape) runs on the
+		// CPU stream: queued on the GPU behind the layers' kernels, each value an op reads back (ToInts) waited for all of them.
+		bool host_ints = false;
+		for (const Arr *a : args) {
+			if (!a) {
+				continue;
+			}
+			const mlx_dtype dt = a->dtype();
+			const bool small_int = (dt == MLX_INT64 || dt == MLX_INT32 || dt == MLX_BOOL) && a->size() <= 4096;
+			if (!small_int) {
+				host_ints = false;
+				break;
+			}
+			host_ints = true;
+		}
+		const Ctx node_ctx {host_ints ? HostStream() : ctx.s};
 		std::vector<Arr> results;
 		try {
-			results = handler->second(node, args, ctx);
+			results = handler->second(node, args, node_ctx);
 		} catch (const std::exception &e) {
 			mlx_stream_free(gpu);
 			Fail(node.op_type + " node '" + node.name + "' failed: " + e.what());
