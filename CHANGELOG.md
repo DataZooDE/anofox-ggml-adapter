@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2026.11.26]
+
 ### Changed
 - MLX plugin: shape arithmetic (nodes whose operands are all small integer or boolean tensors) and the integer read-backs of Reshape,
   Slice, Expand and the like run on MLX's CPU stream. On the GPU stream each read-back waited for every layer kernel queued before it;
