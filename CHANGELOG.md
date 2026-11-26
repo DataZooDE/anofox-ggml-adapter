@@ -14,6 +14,8 @@
   runs 341 of them per call. Golden: rmsnorm_pattern (ReduceMean's tolerance).
 - The CPU's attention fusion looks through PyTorch's SDPA guard Where(IsNaN(p), 0, p) between Softmax and PV: tabfm-v1-1's 36
   attentions per call ran unfused (their [heads, S, S] scores materialised). Golden: sdpa_nan_guard.
+- The attention fusion also accepts a 0/-max mask the shape pass knows on the host (built from shapes alone, as tabfm-v1-1's
+  Where(Less(Range(..)), 0, -max)); it took only runtime masks. Golden: sdpa_known_mask.
 
 ## [2026.11.26]
 

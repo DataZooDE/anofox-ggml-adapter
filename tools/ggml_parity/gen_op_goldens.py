@@ -858,4 +858,14 @@ case("sdpa_nan_guard", "MatMul", {"q": qn5, "k": kn5, "v": vn5, "keep": keep_n},
     helper.make_node("Where", ["nan", "zero", "p"], ["pz"]), helper.make_node("MatMul", ["pz", "v"], ["y"])],
     inits={"zero": np.float32(0.0), "ninf": np.float32(-np.inf)})
 
+
+# A mask the shape pass knows on the host (tabfm-v1-1 builds it from shapes alone: Where(Less(Range...), 0, -max)): fuses like a data mask.
+qk5, kk5, vk5 = rand(1, 2, 70, 8), rand(1, 2, 70, 8), rand(1, 2, 70, 8)
+case("sdpa_known_mask", "MatMul", {"q": qk5, "k": kk5, "v": vk5}, nodes=[
+    helper.make_node("Transpose", ["k"], ["kt"], perm=[0, 1, 3, 2]), helper.make_node("MatMul", ["q", "kt"], ["qk"]),
+    helper.make_node("Where", ["keep", "zero", "lowest"], ["mask"]), helper.make_node("Add", ["qk", "mask"], ["masked"]),
+    helper.make_node("Softmax", ["masked"], ["p"], axis=-1), helper.make_node("MatMul", ["p", "v"], ["y"])],
+    inits={"keep": (np.arange(70)[None, :] < 61)[:, None, None, :], "zero": np.float32(0.0),
+           "lowest": np.float32(np.finfo(np.float32).min)})
+
 print(len(os.listdir(OUT)) // 2, "cases in", os.path.normpath(OUT))

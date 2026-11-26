@@ -1923,7 +1923,10 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 		std::string scores = through_casts(sm->inputs[0]), mask;
 		if (const auto *add = made_by(scores); add && add->op_type == "Add" && add->inputs.size() == 2) {
 			for (int side = 0; side < 2 && mask.empty(); side++) {
-				if (is_f32_data(add->inputs[side]) && is_mask(add->inputs[side])) {
+				// a data mask, or one the shape pass knows on the host (built from shapes alone: tabfm-v1-1's Where(Less(Range..), 0, -max))
+				const ShapeValue *mv = value(add->inputs[side]);
+				const bool f32_mask = is_f32_data(add->inputs[side]) || (mv && mv->known && mv->dtype == ShapeDtype::F32);
+				if (f32_mask && is_mask(add->inputs[side])) {
 					mask = add->inputs[side];
 					scores = through_casts(add->inputs[1 - side]);
 				}
