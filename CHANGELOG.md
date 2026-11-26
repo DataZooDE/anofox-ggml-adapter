@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+- ConstantOfShape whose output is too large to fold on the host (above 2^20 values) is filled on the device instead of failing with
+  "op is not implemented". kumo-tabular fills [1, features, rows, 3, 64]: a table of 1000 rows with 5 or more features failed on the CPU
+  and the ggml GPU plugin. Golden: constantofshape_over_fold_cap.
+
 ## [2026.11.26]
 
 ### Changed

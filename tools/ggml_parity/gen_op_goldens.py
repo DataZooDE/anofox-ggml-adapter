@@ -816,4 +816,15 @@ case("transpose_unit_axis_then_slice", "Slice", {"x": spiked(3, 1, 4)}, nodes=[
     helper.make_node("Slice", ["t", "starts", "ends", "axes"], ["y"])],
     inits={"starts": ax(1), "ends": ax(3), "axes": ax(1)})
 
+
+# An output above the shape pass's fold cap (2^20 values): the shape is known, the value is not materialised on the host, so the engine
+# fills it on the device (kumo-tabular fills [1, features, rows, 3, 64]: 1000 rows of 10 features exceeded the cap). Reduced to a scalar so
+# the golden stays small; 1.1M x 0.25 is exact in float32.
+case("constantofshape_over_fold_cap", "ConstantOfShape", {"x": rand(3)}, nodes=[
+    helper.make_node("Constant", [], ["s"], value=numpy_helper.from_array(np.array([1, 1100, 1000], np.int64), "s")),
+    helper.make_node("ConstantOfShape", ["s"], ["z"], value=numpy_helper.from_array(np.array([0.25], np.float32), "v")),
+    helper.make_node("Constant", [], ["ax"], value=numpy_helper.from_array(np.array([0, 1, 2], np.int64), "ax")),
+    helper.make_node("ReduceSum", ["z", "ax"], ["r"], keepdims=0),
+    helper.make_node("Add", ["x", "r"], ["y"])])
+
 print(len(os.listdir(OUT)) // 2, "cases in", os.path.normpath(OUT))

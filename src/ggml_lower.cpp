@@ -91,6 +91,38 @@ Ne4 ToStorage(const Node &n, const Shape &shape) {
 	return ToNe(n, folded);
 }
 
+//! ConstantOfShape's fill value (the `value` attribute, a one-element tensor; float 0 without it), as the float the engine computes in.
+//! Integers are exact up to 2^24; a larger one is refused rather than rounded.
+float ConstantOfShapeFill(const Node &n) {
+	const auto *a = n.Attr("value");
+	if (!a || !a->has_tensor) {
+		return 0.0f;
+	}
+	const auto &t = a->t;
+	double v = 0.0;
+	if (!t.floats.empty()) {
+		v = t.floats[0];
+	} else if (!t.int64s.empty()) {
+		v = static_cast<double>(t.int64s[0]);
+	} else if (!t.int32s.empty()) {
+		v = t.int32s[0];
+	} else if (!t.raw.empty()) {
+		const char *b = t.raw.data();
+		switch (t.data_type) {
+		case 1: { float f; std::memcpy(&f, b, sizeof f); v = f; break; }
+		case 11: { double d; std::memcpy(&d, b, sizeof d); v = d; break; }
+		case 7: { int64_t i; std::memcpy(&i, b, sizeof i); v = static_cast<double>(i); break; }
+		case 6: { int32_t i; std::memcpy(&i, b, sizeof i); v = i; break; }
+		case 9: v = b[0] != 0; break;
+		default: Fail(n, "a ConstantOfShape value of ONNX type " + std::to_string(t.data_type) + " is not supported");
+		}
+	}
+	if (t.data_type != 1 && t.data_type != 11 && std::fabs(v) > 16777216.0) {
+		Fail(n, "a ConstantOfShape integer value above 2^24 cannot be held exactly in float32");
+	}
+	return static_cast<float>(v);
+}
+
 Ne4 NeOf(const ggml_tensor *t) {
 	return {t->ne[0], t->ne[1], t->ne[2], t->ne[3]};
 }
@@ -2623,6 +2655,11 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 			}
 		} else if (op == "Where") {
 			out = elementwise(3, [&](std::vector<ggml_tensor *> &o, const Ne4 &ne) { return low.Custom(C_WHERE, o, ne); });
+		} else if (op == "ConstantOfShape") {
+			// The shape pass folds it on the host, except above its fold cap (a value too large to materialise there: kumo-tabular fills
+			// [1, features, rows, 3, 64]). The output's shape is still known, so it is filled here, on the device.
+			const Ne4 ne = ToStorage(n, out_shape);
+			out = ggml_fill_inplace(ctx.get(), ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]), ConstantOfShapeFill(n));
 		} else {
 			Fail(n, "op is not implemented in the ggml lowering");
 		}
