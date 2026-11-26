@@ -7,6 +7,10 @@
   "op is not implemented". kumo-tabular fills [1, features, rows, 3, 64]: a table of 1000 rows with 5 or more features failed on the CPU
   and the ggml GPU plugin. Golden: constantofshape_over_fold_cap.
 
+### Changed
+- The CPU fuses attention over rank-5 tensors [B1, B2, H, S, D] as well (held as [B1*B2, H, S, D]): exaone-tabular's feature-context
+  attentions ran unfused, their [heads, S, S] scores materialised and copied. Golden: sdpa_rank5.
+
 ## [2026.11.26]
 
 ### Changed

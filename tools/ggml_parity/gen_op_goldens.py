@@ -827,4 +827,13 @@ case("constantofshape_over_fold_cap", "ConstantOfShape", {"x": rand(3)}, nodes=[
     helper.make_node("ReduceSum", ["z", "ax"], ["r"], keepdims=0),
     helper.make_node("Add", ["x", "r"], ["y"])])
 
+
+# Attention over rank-5 tensors [B1, B2, H, S, D] (exaone-tabular's feature-context attention): the engine holds them as [B1*B2, H, S, D],
+# so they fuse like rank 4 (70 queries: the tiled kernel).
+q5, k5, v5 = rand(2, 2, 3, 70, 8), rand(2, 2, 3, 70, 8), rand(2, 2, 3, 70, 8)
+case("sdpa_rank5", "MatMul", {"q": q5, "k": k5, "v": v5}, nodes=[
+    helper.make_node("Transpose", ["k"], ["kt"], perm=[0, 1, 2, 4, 3]), helper.make_node("MatMul", ["q", "kt"], ["qk"]),
+    helper.make_node("Mul", ["qk", "scale"], ["scaled"]), helper.make_node("Softmax", ["scaled"], ["p"], axis=-1),
+    helper.make_node("MatMul", ["p", "v"], ["y"])], inits={"scale": np.float32(1.0 / np.sqrt(8))})
+
 print(len(os.listdir(OUT)) // 2, "cases in", os.path.normpath(OUT))

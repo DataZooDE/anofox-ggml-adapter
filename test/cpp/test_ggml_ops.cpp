@@ -960,7 +960,7 @@ TEST_CASE("ggml_lowering: scaled-dot-product attention fuses into one flash atte
 	};
 	for (const Want &w : {Want {"sdpa_band_keypad_tiled", 1}, Want {"sdpa_keypad_short_swapped", 1}, Want {"sdpa_no_mask", 1},
 	                      Want {"sdpa_float_bias_unfused", 0}, Want {"sdpa_shared_mask_two_query_lengths", 2},
-	                      Want {"sdpa_single_query_split_kv", 1}}) {
+	                      Want {"sdpa_single_query_split_kv", 1}, Want {"sdpa_rank5", 1}}) {
 		const std::string stem = std::string("test/fixtures/ggml_ops/") + w.stem;
 		INFO("case " << w.stem);
 		const Case c = ReadCase(stem);

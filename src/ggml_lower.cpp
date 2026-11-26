@@ -1887,16 +1887,26 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 			return false;
 		};
 
+		// A rank-5 attention [B1, B2, H, S, D] (exaone-tabular) is held as [B1*B2, H, S, D] (ToStorage): it fuses as rank 4 with B = B1*B2.
+		auto as4 = [](const Shape &shape) -> Shape {
+			if (shape.size() <= 4) {
+				return shape;
+			}
+			Shape merged(shape.end() - 3, shape.end());
+			merged.insert(merged.begin(), Numel(Shape(shape.begin(), shape.end() - 3)));
+			return merged;
+		};
 		const auto *sm = made_by(through_casts(n.inputs.at(0)));
 		if (!sm || sm->op_type != "Softmax" || n.inputs.size() != 2) {
 			return nullptr;
 		}
 		const ShapeValue *sm_in = value(sm->inputs.at(0));
-		if (!sm_in || sm_in->shape.size() != 4) {
+		if (!sm_in || sm_in->shape.size() < 4 || sm_in->shape.size() > 5) {
 			return nullptr;
 		}
+		const int64_t sm_rank = static_cast<int64_t>(sm_in->shape.size());
 		const int64_t sm_axis = sm->Attr("axis") ? sm->Attr("axis")->i : -1;
-		if (sm_axis != -1 && sm_axis != 3) {
+		if (sm_axis != -1 && sm_axis != sm_rank - 1) {
 			return nullptr;
 		}
 		std::string scores = through_casts(sm->inputs[0]), mask;
@@ -1929,23 +1939,25 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 		if (!is_f32_data(qn) || !is_f32_data(ktn) || !is_f32_data(vn)) {
 			return nullptr;
 		}
-		const Shape &qs = value(qn)->shape, &kts = value(ktn)->shape, &vs = value(vn)->shape;
-		if (qs.size() != 4 || kts.size() != 4 || vs.size() != 4) {
-			return nullptr;
+		const Shape &q_full = value(qn)->shape, &kt_full = value(ktn)->shape, &v_full = value(vn)->shape;
+		if (q_full.size() != static_cast<size_t>(sm_rank) || kt_full.size() != q_full.size() || v_full.size() != q_full.size() ||
+		    !std::equal(q_full.begin(), q_full.end() - 3, kt_full.begin()) || !std::equal(q_full.begin(), q_full.end() - 3, v_full.begin())) {
+			return nullptr; // the merged leading dimensions must be the same tensor's (no broadcast across them)
 		}
+		const Shape qs = as4(q_full), kts = as4(kt_full), vs = as4(v_full);
 		const int64_t B = qs[0], H = qs[1], S = qs[2], D = qs[3], SK = kts[3];
 		if (kts[0] != B || kts[1] != H || kts[2] != D || vs[0] != B || vs[1] != H || vs[2] != SK) {
 			return nullptr; // broadcast batch or head dimensions: left to the unfused lowering
 		}
 		const ShapeValue *out_value = value(n.outputs.at(0));
-		if (!out_value || out_value->shape != Shape {B, H, S, vs[3]}) {
+		if (!out_value || out_value->shape.size() != q_full.size() || as4(out_value->shape) != Shape {B, H, S, vs[3]}) {
 			return nullptr;
 		}
 		Shape ms; // the mask's shape right-aligned to four dimensions; checked before any tensor is created
 		if (!mask.empty()) {
 			ms = value(mask)->shape;
 			if (ms.size() > 4) {
-				return nullptr;
+				return nullptr; // a rank-5 mask would need its own merge: left to the unfused lowering
 			}
 			ms.insert(ms.begin(), 4 - ms.size(), 1);
 			if (ms[3] != SK || (ms[2] != 1 && ms[2] != S) || (ms[1] != 1 && ms[1] != H) || (ms[0] != 1 && ms[0] != B)) {
