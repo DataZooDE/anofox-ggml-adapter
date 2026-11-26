@@ -12,6 +12,8 @@
   attentions ran unfused, their [heads, S, S] scores materialised and copied. Golden: sdpa_rank5.
 - RMSNorm spelled out (Pow, ReduceMean, Add eps, Sqrt, Reciprocal, Mul) lowers to one ggml_rms_norm on every backend: tabfm-v1-1
   runs 341 of them per call. Golden: rmsnorm_pattern (ReduceMean's tolerance).
+- The CPU's attention fusion looks through PyTorch's SDPA guard Where(IsNaN(p), 0, p) between Softmax and PV: tabfm-v1-1's 36
+  attentions per call ran unfused (their [heads, S, S] scores materialised). Golden: sdpa_nan_guard.
 
 ## [2026.11.26]
 

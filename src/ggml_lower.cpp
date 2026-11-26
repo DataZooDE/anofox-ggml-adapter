@@ -1896,7 +1896,18 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 			merged.insert(merged.begin(), Numel(Shape(shape.begin(), shape.end() - 3)));
 			return merged;
 		};
-		const auto *sm = made_by(through_casts(n.inputs.at(0)));
+		std::string probs = through_casts(n.inputs.at(0));
+		// PyTorch's SDPA export guards the probabilities with Where(IsNaN(p), 0, p): only a row whose every key is masked is NaN, and such
+		// rows are padding nothing reads (the fused kernel gives them finite values instead of zeros; see the fully-masked-row test).
+		if (const auto *w = made_by(probs); w && w->op_type == "Where" && w->inputs.size() == 3) {
+			const auto *isnan = made_by(w->inputs[0]);
+			double zero = 1.0;
+			if (isnan && isnan->op_type == "IsNaN" && isnan->inputs.size() == 1 && scalar_of(w->inputs[1], zero) && zero == 0.0 &&
+			    through_casts(w->inputs[2]) == through_casts(isnan->inputs[0])) {
+				probs = through_casts(w->inputs[2]);
+			}
+		}
+		const auto *sm = made_by(probs);
 		if (!sm || sm->op_type != "Softmax" || n.inputs.size() != 2) {
 			return nullptr;
 		}

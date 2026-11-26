@@ -846,4 +846,16 @@ case("rmsnorm_pattern", "ReduceMean", {"x": rand(2, 5, 16)}, nodes=[
     helper.make_node("Mul", ["xn", "w"], ["y"])],
     inits={"two": np.float32(2.0), "axes": ax(-1), "eps": np.float32(1e-6), "w": rand(16)})
 
+
+# PyTorch's SDPA export (tabfm-v1-1, 36 per call): no scale Mul (folded into q), a -inf key-padding mask, and Softmax guarded by
+# Where(IsNaN(p), 0, p) before PV (a fully masked row would be NaN; here every row sees a key). Fuses like the plain pattern.
+qn5, kn5, vn5 = rand(1, 2, 70, 8), rand(1, 2, 70, 8), rand(1, 2, 70, 8)
+keep_n = (np.arange(70)[None, :] < np.array([[52]]))[:, None, None, :]
+case("sdpa_nan_guard", "MatMul", {"q": qn5, "k": kn5, "v": vn5, "keep": keep_n}, nodes=[
+    helper.make_node("Transpose", ["k"], ["kt"], perm=[0, 1, 3, 2]), helper.make_node("MatMul", ["q", "kt"], ["qk"]),
+    helper.make_node("Where", ["keep", "zero", "ninf"], ["mask"]), helper.make_node("Add", ["qk", "mask"], ["masked"]),
+    helper.make_node("Softmax", ["masked"], ["p"], axis=-1), helper.make_node("IsNaN", ["p"], ["nan"]),
+    helper.make_node("Where", ["nan", "zero", "p"], ["pz"]), helper.make_node("MatMul", ["pz", "v"], ["y"])],
+    inits={"zero": np.float32(0.0), "ninf": np.float32(-np.inf)})
+
 print(len(os.listdir(OUT)) // 2, "cases in", os.path.normpath(OUT))
