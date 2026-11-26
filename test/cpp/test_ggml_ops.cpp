@@ -981,6 +981,25 @@ TEST_CASE("ggml_lowering: scaled-dot-product attention fuses into one flash atte
 	}
 }
 
+// RMSNorm spelled out (Pow, ReduceMean, Add eps, Sqrt, Reciprocal, Mul) is five passes over the activations and a mean: tabfm-v1-1 has
+// 341 of them. The lowering recognises the pattern and emits one ggml_rms_norm, on every backend.
+TEST_CASE("ggml_lowering: an exported RMSNorm fuses into one rms_norm", "[adapter][ggml][ggml_ops][rmsnorm]") {
+	const std::string stem = "test/fixtures/ggml_ops/rmsnorm_pattern";
+	const Case c = ReadCase(stem);
+	const auto graph = ReadGraph(stem);
+	for (const std::string device : {"cpu", "cpu-sched"}) {
+		INFO("device " << device);
+		GgmlExecutorConfig config;
+		config.threads = 3;
+		config.device = device;
+		GgmlExecutor executor(graph, config);
+		const auto ops = executor.GraphOpCounts(c.inputs, GgmlRunOptions {});
+		REQUIRE(ops.count("RMS_NORM"));
+		REQUIRE(ops.at("RMS_NORM") == 1);
+		REQUIRE(ops.count("MEAN") == 0); // the unfused chain is not computed next to the fused op
+	}
+}
+
 TEST_CASE("ggml_lowering: a fully masked query row gives finite values under the fused attention", "[adapter][ggml][ggml_ops][attention]") {
 	// Rows whose every key is masked are padding (a padded position far outside the sliding window); nothing reads them, but a NaN there
 	// would poison any later reduction that does not mask it. ORT returns a uniform average there, the fused kernel 0: both finite.

@@ -10,6 +10,8 @@
 ### Changed
 - The CPU fuses attention over rank-5 tensors [B1, B2, H, S, D] as well (held as [B1*B2, H, S, D]): exaone-tabular's feature-context
   attentions ran unfused, their [heads, S, S] scores materialised and copied. Golden: sdpa_rank5.
+- RMSNorm spelled out (Pow, ReduceMean, Add eps, Sqrt, Reciprocal, Mul) lowers to one ggml_rms_norm on every backend: tabfm-v1-1
+  runs 341 of them per call. Golden: rmsnorm_pattern (ReduceMean's tolerance).
 
 ## [2026.11.26]
 

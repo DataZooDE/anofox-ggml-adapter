@@ -2062,6 +2062,74 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 		return nullptr;
 	};
 
+	// RMSNorm, as tabfm-v1-1 exports it: Mul(x, Reciprocal(Sqrt(Add(ReduceMean(Pow(x, 2), last axis, keepdims), eps)))) (either operand
+	// order). Spelled out it is five passes over the activations and a mean per row; ggml_rms_norm is one. On every backend.
+	auto fuse_rmsnorm = [&](const ::anofox::onnxread::Node &n) -> ggml_tensor * {
+		auto made_by = [&](const std::string &t) -> const ::anofox::onnxread::Node * {
+			const auto it = producer.find(t);
+			return it == producer.end() ? nullptr : it->second;
+		};
+		auto known_scalar = [&](const std::string &t, double &out) {
+			const auto it = low.shapes.find(t);
+			if (it == low.shapes.end() || !it->second.known || it->second.dtype != ShapeDtype::F32 || it->second.floats.size() != 1) {
+				return false;
+			}
+			out = it->second.floats[0];
+			return true;
+		};
+		if (n.inputs.size() != 2) {
+			return nullptr;
+		}
+		for (int side = 0; side < 2; side++) {
+			const std::string &x = n.inputs[side], &inv = n.inputs[1 - side];
+			const auto *rec = made_by(inv);
+			if (!rec || rec->op_type != "Reciprocal" || rec->inputs.size() != 1) {
+				continue;
+			}
+			const auto *sq = made_by(rec->inputs[0]);
+			if (!sq || sq->op_type != "Sqrt" || sq->inputs.size() != 1) {
+				continue;
+			}
+			const auto *add = made_by(sq->inputs[0]);
+			if (!add || add->op_type != "Add" || add->inputs.size() != 2) {
+				continue;
+			}
+			double eps = 0.0;
+			int mean_side = -1;
+			for (int a = 0; a < 2 && mean_side < 0; a++) {
+				const auto *m = made_by(add->inputs[a]);
+				if (m && m->op_type == "ReduceMean" && known_scalar(add->inputs[1 - a], eps)) {
+					mean_side = a;
+				}
+			}
+			if (mean_side < 0 || !(eps >= 0.0)) {
+				continue;
+			}
+			const auto *mean = made_by(add->inputs[mean_side]);
+			const auto *pw = made_by(mean->inputs.at(0));
+			double exponent = 0.0;
+			if (!pw || pw->op_type != "Pow" || pw->inputs.size() != 2 || pw->inputs[0] != x || !known_scalar(pw->inputs[1], exponent) ||
+			    exponent != 2.0) {
+				continue;
+			}
+			const auto xv = low.shapes.find(x);
+			if (xv == low.shapes.end() || xv->second.known || xv->second.dtype != ShapeDtype::F32 || xv->second.shape.empty() ||
+			    xv->second.shape != low.shapes.at(n.outputs.at(0)).shape) {
+				return nullptr;
+			}
+			// the mean over the last axis only, keeping it (its output is x's shape with the last dimension 1)
+			const auto mv = low.shapes.find(mean->outputs.at(0));
+			Shape want = xv->second.shape;
+			want.back() = 1;
+			const bool keepdims = !mean->Attr("keepdims") || mean->Attr("keepdims")->i != 0;
+			if (!keepdims || mv == low.shapes.end() || mv->second.shape != want || xv->second.shape.back() == 1) {
+				return nullptr;
+			}
+			return ggml_rms_norm(ctx.get(), low.Contiguous(tensor_of(n, x)), static_cast<float>(eps));
+		}
+		return nullptr;
+	};
+
 	for (const auto &n : graph.nodes) {
 		bool needed_here = false;
 		for (const auto &o : n.outputs) {
@@ -2245,6 +2313,7 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 			      : op == "Log"  ? ggml_log(ctx.get(), x)
 			                     : ggml_tanh(ctx.get(), x);
 		} else if (op == "Mul" && (out = fuse_gelu(n)) != nullptr) {
+		} else if (op == "Mul" && (out = fuse_rmsnorm(n)) != nullptr) {
 			// the fused exact GELU (above)
 		} else if (op == "Add" || op == "Sub" || op == "Mul" || op == "Div") {
 			// Integers computed from float data live as floats; ONNX integer Div truncates toward zero.

@@ -836,4 +836,14 @@ case("sdpa_rank5", "MatMul", {"q": q5, "k": k5, "v": v5}, nodes=[
     helper.make_node("Mul", ["qk", "scale"], ["scaled"]), helper.make_node("Softmax", ["scaled"], ["p"], axis=-1),
     helper.make_node("MatMul", ["p", "v"], ["y"])], inits={"scale": np.float32(1.0 / np.sqrt(8))})
 
+
+# RMSNorm as tabfm-v1-1 exports it: Mul(Mul(x, Reciprocal(Sqrt(Add(ReduceMean(Pow(x, 2), -1, keepdims), eps)))), weight), 341 times;
+# fused into one ggml_rms_norm (the mean of squares accumulates: held to ReduceMean's tolerance).
+case("rmsnorm_pattern", "ReduceMean", {"x": rand(2, 5, 16)}, nodes=[
+    helper.make_node("Pow", ["x", "two"], ["sq"]), helper.make_node("ReduceMean", ["sq", "axes"], ["ms"], keepdims=1),
+    helper.make_node("Add", ["ms", "eps"], ["mse"]), helper.make_node("Sqrt", ["mse"], ["rms"]),
+    helper.make_node("Reciprocal", ["rms"], ["inv"]), helper.make_node("Mul", ["x", "inv"], ["xn"]),
+    helper.make_node("Mul", ["xn", "w"], ["y"])],
+    inits={"two": np.float32(2.0), "axes": ax(-1), "eps": np.float32(1e-6), "w": rand(16)})
+
 print(len(os.listdir(OUT)) // 2, "cases in", os.path.normpath(OUT))
