@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2026.11.27]
+
 ### Fixed
 - ConstantOfShape whose output is too large to fold on the host (above 2^20 values) is filled on the device instead of failing with
   "op is not implemented". kumo-tabular fills [1, features, rows, 3, 64]: a table of 1000 rows with 5 or more features failed on the CPU
