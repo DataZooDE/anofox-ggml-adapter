@@ -1636,7 +1636,8 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 	Lowering low;
 	low.ctx = ctx.get();
 	low.strict_fp32 = options.strict_fp32;
-	low.accelerate = (options.device == "cpu" || options.device == "cpu-sched") && !EnvAlias("ANOFOX_GGML_NO_ACCELERATE", "ANOFOX_GGML_NO_ACCELERATE");
+	low.accelerate = (options.device == "cpu" || options.device == "cpu-sched") && !options.batch_invariant &&
+	                 !EnvAlias("ANOFOX_GGML_NO_ACCELERATE", "ANOFOX_GGML_NO_ACCELERATE");
 	low.shapes = std::move(evaluated.values);
 
 	// Leaves: graph inputs and float initializers. Their data is copied in after the allocator placed them.
@@ -3342,6 +3343,7 @@ Compiled *GgmlExecutor::Impl::Acquire(const HostTensors &inputs, const GgmlRunOp
 	GgmlRunOptions compile_options = options;
 	compile_options.weights = impl.config.weights;
 	compile_options.strict_fp32 = impl.config.strict_fp32;
+	compile_options.batch_invariant = impl.config.batch_invariant;
 	compile_options.device = impl.config.device; // the lowering fuses attention only where the CPU backend runs the graph
 	WeightProvider provider;
 	if (!impl.runtime.sched_backends.empty()) {
@@ -3512,6 +3514,7 @@ HostTensors GgmlRunGraph(const ::anofox::onnxread::Graph &graph, const HostTenso
 	config.cache_entries = 1;
 	config.device = options.device;
 	config.strict_fp32 = options.strict_fp32;
+	config.batch_invariant = options.batch_invariant;
 	GgmlExecutor executor(graph, std::move(config));
 	return executor.Run(inputs, options);
 }

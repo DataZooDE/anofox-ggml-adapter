@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+- GgmlExecutorConfig::batch_invariant: a row's result does not depend on how many rows share the call. It keeps Accelerate's SGEMM off
+  on Apple builds, whose blocking depends on the row count (anofox-tabfm's batched queries differed in the last bits on macOS).
+
 ## [2026.11.27]
 
 ### Fixed

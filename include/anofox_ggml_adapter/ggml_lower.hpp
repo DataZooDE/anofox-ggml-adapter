@@ -55,6 +55,7 @@ struct GgmlRunOptions {
 	std::vector<std::string> outputs;           // outputs to return; empty = all graph outputs. Nodes nothing requested depends on are not run.
 	std::string device = "cpu";                 // see GgmlExecutorConfig::device (used by the one-shot GgmlRunGraph; an executor has its own)
 	bool strict_fp32 = false;                   // see GgmlExecutorConfig::strict_fp32 (the executor fills this in from its own configuration)
+	bool batch_invariant = false;               // see GgmlExecutorConfig::batch_invariant (likewise)
 };
 
 //! Run `graph` on the float `inputs` (plus the typed inputs in `options`) and return its outputs, through ggml. Inline initializers are read from the
@@ -78,6 +79,9 @@ struct GgmlExecutorConfig {
 	//! fewer rows (its small-batch kernel), and the NVIDIA TF32 switch does not reach that kernel. With this set, every weight matmul is padded to 17 activation
 	//! rows (zero rows, sliced off afterwards) so ggml takes its cuBLAS path, which honours the switch. Costs a few rows of extra work on tiny matmuls.
 	bool strict_fp32 = false;
+	//! A row's result must not depend on how many rows share the call (anofox-tabfm answers a row the same however the rows are batched).
+	//! Keeps off the paths whose blocking depends on the row count: Accelerate's SGEMM on Apple builds. ggml's own kernels are row-invariant.
+	bool batch_invariant = false;
 	//! Free device memory in bytes (a test seam, and for backends ggml cannot ask): when set it replaces the query of the device itself in PreloadWeights.
 	std::function<size_t()> device_memory_probe;
 	//! What the host tells its user to do when the device runs out of memory (appended to the error).
