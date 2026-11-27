@@ -18,6 +18,8 @@
   Where(Less(Range(..)), 0, -max)); it took only runtime masks. Golden: sdpa_known_mask.
 - The exact-GELU fusion also matches the half inside, x * (0.5 * (erf(x / sqrt 2) + 1)), as kumo-tabular exports it (29 per call ran
   as Div, a custom Erf kernel, Add and two Mul). Golden: gelu_erf_pattern_half_inside.
+- A batched activation times a 2-D weight runs as one matmul over all the activation's rows instead of one small matmul per batch
+  (kumo-tabular's [25200, 4, 32] x [32, 64] ran at ~9 GFLOP/s). Golden: matmul_batched_activation_2d_weight.
 
 ## [2026.11.26]
 

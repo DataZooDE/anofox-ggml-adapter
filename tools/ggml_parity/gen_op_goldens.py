@@ -876,4 +876,9 @@ case("gelu_erf_pattern_half_inside", "Erf", {"x": spiked(4, 64)}, nodes=[
     helper.make_node("Mul", ["x", "h"], ["y"])],
     inits={"sqrt2": np.float32(1.4142135), "one": np.float32(1.0), "half": np.float32(0.5)})
 
+
+# A batched activation times a 2-D weight (kumo-tabular: [B, 4, 32] x [32, 64] over B = 25200): one matmul over B*4 rows, not B tiny ones.
+case("matmul_batched_activation_2d_weight", "MatMul", {"a": rand(300, 4, 32)}, inits={"w": rand(32, 64)},
+     nodes=[helper.make_node("MatMul", ["a", "w"], ["y"])])
+
 print(len(os.listdir(OUT)) // 2, "cases in", os.path.normpath(OUT))

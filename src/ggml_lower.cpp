@@ -889,9 +889,15 @@ struct Lowering {
 				Fail(n, "batch dimensions do not broadcast");
 			}
 		}
+		// A 2-D weight against a batched activation is one matmul over all the activation's rows: ggml would run one small matmul per
+		// batch (kumo-tabular: 25200 batches of 4 rows ran at ~9 GFLOP/s). The rows are already contiguous in the batches' order.
+		if (ne_b[2] == 1 && ne_b[3] == 1 && (ne_a[2] > 1 || ne_a[3] > 1)) {
+			ne_a = {k, m * ne_a[2] * ne_a[3], 1, 1};
+			ne_out = {nn, ne_a[1], 1, 1};
+		}
 		ggml_tensor *A = ggml_reshape_4d(ctx, Contiguous(a), ne_a[0], ne_a[1], ne_a[2], ne_a[3]);
 		ggml_tensor *B = ggml_reshape_4d(ctx, Contiguous(b), ne_b[0], ne_b[1], ne_b[2], ne_b[3]);
-		A = RepeatTo(A, {k, m, ne_out[2], ne_out[3]}); // ggml_mul_mat broadcasts its FIRST operand over batches only
+		A = RepeatTo(A, {k, ne_a[1], ne_out[2], ne_out[3]}); // ggml_mul_mat broadcasts its FIRST operand over batches only
 		// ggml computes dst = src1 * src0^T over ne0: src0 must hold the weight with ne [k, n]; ONNX B is [n, k].
 		ggml_tensor *BT = nullptr;
 		const auto origin = transposed_from.find(b);
