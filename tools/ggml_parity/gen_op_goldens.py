@@ -816,4 +816,69 @@ case("transpose_unit_axis_then_slice", "Slice", {"x": spiked(3, 1, 4)}, nodes=[
     helper.make_node("Slice", ["t", "starts", "ends", "axes"], ["y"])],
     inits={"starts": ax(1), "ends": ax(3), "axes": ax(1)})
 
+
+# An output above the shape pass's fold cap (2^20 values): the shape is known, the value is not materialised on the host, so the engine
+# fills it on the device (kumo-tabular fills [1, features, rows, 3, 64]: 1000 rows of 10 features exceeded the cap). Reduced to a scalar so
+# the golden stays small; 1.1M x 0.25 is exact in float32.
+case("constantofshape_over_fold_cap", "ConstantOfShape", {"x": rand(3)}, nodes=[
+    helper.make_node("Constant", [], ["s"], value=numpy_helper.from_array(np.array([1, 1100, 1000], np.int64), "s")),
+    helper.make_node("ConstantOfShape", ["s"], ["z"], value=numpy_helper.from_array(np.array([0.25], np.float32), "v")),
+    helper.make_node("Constant", [], ["ax"], value=numpy_helper.from_array(np.array([0, 1, 2], np.int64), "ax")),
+    helper.make_node("ReduceSum", ["z", "ax"], ["r"], keepdims=0),
+    helper.make_node("Add", ["x", "r"], ["y"])])
+
+
+# Attention over rank-5 tensors [B1, B2, H, S, D] (exaone-tabular's feature-context attention): the engine holds them as [B1*B2, H, S, D],
+# so they fuse like rank 4 (70 queries: the tiled kernel).
+q5, k5, v5 = rand(2, 2, 3, 70, 8), rand(2, 2, 3, 70, 8), rand(2, 2, 3, 70, 8)
+case("sdpa_rank5", "MatMul", {"q": q5, "k": k5, "v": v5}, nodes=[
+    helper.make_node("Transpose", ["k"], ["kt"], perm=[0, 1, 2, 4, 3]), helper.make_node("MatMul", ["q", "kt"], ["qk"]),
+    helper.make_node("Mul", ["qk", "scale"], ["scaled"]), helper.make_node("Softmax", ["scaled"], ["p"], axis=-1),
+    helper.make_node("MatMul", ["p", "v"], ["y"])], inits={"scale": np.float32(1.0 / np.sqrt(8))})
+
+
+# RMSNorm as tabfm-v1-1 exports it: Mul(Mul(x, Reciprocal(Sqrt(Add(ReduceMean(Pow(x, 2), -1, keepdims), eps)))), weight), 341 times;
+# fused into one ggml_rms_norm (the mean of squares accumulates: held to ReduceMean's tolerance).
+case("rmsnorm_pattern", "ReduceMean", {"x": rand(2, 5, 16)}, nodes=[
+    helper.make_node("Pow", ["x", "two"], ["sq"]), helper.make_node("ReduceMean", ["sq", "axes"], ["ms"], keepdims=1),
+    helper.make_node("Add", ["ms", "eps"], ["mse"]), helper.make_node("Sqrt", ["mse"], ["rms"]),
+    helper.make_node("Reciprocal", ["rms"], ["inv"]), helper.make_node("Mul", ["x", "inv"], ["xn"]),
+    helper.make_node("Mul", ["xn", "w"], ["y"])],
+    inits={"two": np.float32(2.0), "axes": ax(-1), "eps": np.float32(1e-6), "w": rand(16)})
+
+
+# PyTorch's SDPA export (tabfm-v1-1, 36 per call): no scale Mul (folded into q), a -inf key-padding mask, and Softmax guarded by
+# Where(IsNaN(p), 0, p) before PV (a fully masked row would be NaN; here every row sees a key). Fuses like the plain pattern.
+qn5, kn5, vn5 = rand(1, 2, 70, 8), rand(1, 2, 70, 8), rand(1, 2, 70, 8)
+keep_n = (np.arange(70)[None, :] < np.array([[52]]))[:, None, None, :]
+case("sdpa_nan_guard", "MatMul", {"q": qn5, "k": kn5, "v": vn5, "keep": keep_n}, nodes=[
+    helper.make_node("Transpose", ["k"], ["kt"], perm=[0, 1, 3, 2]), helper.make_node("MatMul", ["q", "kt"], ["qk"]),
+    helper.make_node("Where", ["keep", "zero", "ninf"], ["mask"]), helper.make_node("Add", ["qk", "mask"], ["masked"]),
+    helper.make_node("Softmax", ["masked"], ["p"], axis=-1), helper.make_node("IsNaN", ["p"], ["nan"]),
+    helper.make_node("Where", ["nan", "zero", "p"], ["pz"]), helper.make_node("MatMul", ["pz", "v"], ["y"])],
+    inits={"zero": np.float32(0.0), "ninf": np.float32(-np.inf)})
+
+
+# A mask the shape pass knows on the host (tabfm-v1-1 builds it from shapes alone: Where(Less(Range...), 0, -max)): fuses like a data mask.
+qk5, kk5, vk5 = rand(1, 2, 70, 8), rand(1, 2, 70, 8), rand(1, 2, 70, 8)
+case("sdpa_known_mask", "MatMul", {"q": qk5, "k": kk5, "v": vk5}, nodes=[
+    helper.make_node("Transpose", ["k"], ["kt"], perm=[0, 1, 3, 2]), helper.make_node("MatMul", ["q", "kt"], ["qk"]),
+    helper.make_node("Where", ["keep", "zero", "lowest"], ["mask"]), helper.make_node("Add", ["qk", "mask"], ["masked"]),
+    helper.make_node("Softmax", ["masked"], ["p"], axis=-1), helper.make_node("MatMul", ["p", "v"], ["y"])],
+    inits={"keep": (np.arange(70)[None, :] < 61)[:, None, None, :], "zero": np.float32(0.0),
+           "lowest": np.float32(np.finfo(np.float32).min)})
+
+
+# Exact GELU with the half inside, as kumo-tabular exports it: x * (0.5 * (erf(x / sqrt 2) + 1)).
+case("gelu_erf_pattern_half_inside", "Erf", {"x": spiked(4, 64)}, nodes=[
+    helper.make_node("Div", ["x", "sqrt2"], ["d"]), helper.make_node("Erf", ["d"], ["e"]),
+    helper.make_node("Add", ["e", "one"], ["a"]), helper.make_node("Mul", ["half", "a"], ["h"]),
+    helper.make_node("Mul", ["x", "h"], ["y"])],
+    inits={"sqrt2": np.float32(1.4142135), "one": np.float32(1.0), "half": np.float32(0.5)})
+
+
+# A batched activation times a 2-D weight (kumo-tabular: [B, 4, 32] x [32, 64] over B = 25200): one matmul over B*4 rows, not B tiny ones.
+case("matmul_batched_activation_2d_weight", "MatMul", {"a": rand(300, 4, 32)}, inits={"w": rand(32, 64)},
+     nodes=[helper.make_node("MatMul", ["a", "w"], ["y"])])
+
 print(len(os.listdir(OUT)) // 2, "cases in", os.path.normpath(OUT))

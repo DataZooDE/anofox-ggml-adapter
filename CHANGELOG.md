@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+### Fixed
+- ConstantOfShape whose output is too large to fold on the host (above 2^20 values) is filled on the device instead of failing with
+  "op is not implemented". kumo-tabular fills [1, features, rows, 3, 64]: a table of 1000 rows with 5 or more features failed on the CPU
+  and the ggml GPU plugin. Golden: constantofshape_over_fold_cap.
+
+### Changed
+- The CPU fuses attention over rank-5 tensors [B1, B2, H, S, D] as well (held as [B1*B2, H, S, D]): exaone-tabular's feature-context
+  attentions ran unfused, their [heads, S, S] scores materialised and copied. Golden: sdpa_rank5.
+- RMSNorm spelled out (Pow, ReduceMean, Add eps, Sqrt, Reciprocal, Mul) lowers to one ggml_rms_norm on every backend: tabfm-v1-1
+  runs 341 of them per call. Golden: rmsnorm_pattern (ReduceMean's tolerance).
+- The CPU's attention fusion looks through PyTorch's SDPA guard Where(IsNaN(p), 0, p) between Softmax and PV: tabfm-v1-1's 36
+  attentions per call ran unfused (their [heads, S, S] scores materialised). Golden: sdpa_nan_guard.
+- The attention fusion also accepts a 0/-max mask the shape pass knows on the host (built from shapes alone, as tabfm-v1-1's
+  Where(Less(Range(..)), 0, -max)); it took only runtime masks. Golden: sdpa_known_mask.
+- The exact-GELU fusion also matches the half inside, x * (0.5 * (erf(x / sqrt 2) + 1)), as kumo-tabular exports it (29 per call ran
+  as Div, a custom Erf kernel, Add and two Mul). Golden: gelu_erf_pattern_half_inside.
+- A batched activation times a 2-D weight runs as one matmul over all the activation's rows instead of one small matmul per batch
+  (kumo-tabular's [25200, 4, 32] x [32, 64] ran at ~9 GFLOP/s). Golden: matmul_batched_activation_2d_weight.
+
 ## [2026.11.26]
 
 ### Changed

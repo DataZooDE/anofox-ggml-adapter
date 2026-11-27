@@ -91,6 +91,38 @@ Ne4 ToStorage(const Node &n, const Shape &shape) {
 	return ToNe(n, folded);
 }
 
+//! ConstantOfShape's fill value (the `value` attribute, a one-element tensor; float 0 without it), as the float the engine computes in.
+//! Integers are exact up to 2^24; a larger one is refused rather than rounded.
+float ConstantOfShapeFill(const Node &n) {
+	const auto *a = n.Attr("value");
+	if (!a || !a->has_tensor) {
+		return 0.0f;
+	}
+	const auto &t = a->t;
+	double v = 0.0;
+	if (!t.floats.empty()) {
+		v = t.floats[0];
+	} else if (!t.int64s.empty()) {
+		v = static_cast<double>(t.int64s[0]);
+	} else if (!t.int32s.empty()) {
+		v = t.int32s[0];
+	} else if (!t.raw.empty()) {
+		const char *b = t.raw.data();
+		switch (t.data_type) {
+		case 1: { float f; std::memcpy(&f, b, sizeof f); v = f; break; }
+		case 11: { double d; std::memcpy(&d, b, sizeof d); v = d; break; }
+		case 7: { int64_t i; std::memcpy(&i, b, sizeof i); v = static_cast<double>(i); break; }
+		case 6: { int32_t i; std::memcpy(&i, b, sizeof i); v = i; break; }
+		case 9: v = b[0] != 0; break;
+		default: Fail(n, "a ConstantOfShape value of ONNX type " + std::to_string(t.data_type) + " is not supported");
+		}
+	}
+	if (t.data_type != 1 && t.data_type != 11 && std::fabs(v) > 16777216.0) {
+		Fail(n, "a ConstantOfShape integer value above 2^24 cannot be held exactly in float32");
+	}
+	return static_cast<float>(v);
+}
+
 Ne4 NeOf(const ggml_tensor *t) {
 	return {t->ne[0], t->ne[1], t->ne[2], t->ne[3]};
 }
@@ -857,9 +889,15 @@ struct Lowering {
 				Fail(n, "batch dimensions do not broadcast");
 			}
 		}
+		// A 2-D weight against a batched activation is one matmul over all the activation's rows: ggml would run one small matmul per
+		// batch (kumo-tabular: 25200 batches of 4 rows ran at ~9 GFLOP/s). The rows are already contiguous in the batches' order.
+		if (ne_b[2] == 1 && ne_b[3] == 1 && (ne_a[2] > 1 || ne_a[3] > 1)) {
+			ne_a = {k, m * ne_a[2] * ne_a[3], 1, 1};
+			ne_out = {nn, ne_a[1], 1, 1};
+		}
 		ggml_tensor *A = ggml_reshape_4d(ctx, Contiguous(a), ne_a[0], ne_a[1], ne_a[2], ne_a[3]);
 		ggml_tensor *B = ggml_reshape_4d(ctx, Contiguous(b), ne_b[0], ne_b[1], ne_b[2], ne_b[3]);
-		A = RepeatTo(A, {k, m, ne_out[2], ne_out[3]}); // ggml_mul_mat broadcasts its FIRST operand over batches only
+		A = RepeatTo(A, {k, ne_a[1], ne_out[2], ne_out[3]}); // ggml_mul_mat broadcasts its FIRST operand over batches only
 		// ggml computes dst = src1 * src0^T over ne0: src0 must hold the weight with ne [k, n]; ONNX B is [n, k].
 		ggml_tensor *BT = nullptr;
 		const auto origin = transposed_from.find(b);
@@ -1855,22 +1893,46 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 			return false;
 		};
 
-		const auto *sm = made_by(through_casts(n.inputs.at(0)));
+		// A rank-5 attention [B1, B2, H, S, D] (exaone-tabular) is held as [B1*B2, H, S, D] (ToStorage): it fuses as rank 4 with B = B1*B2.
+		auto as4 = [](const Shape &shape) -> Shape {
+			if (shape.size() <= 4) {
+				return shape;
+			}
+			Shape merged(shape.end() - 3, shape.end());
+			merged.insert(merged.begin(), Numel(Shape(shape.begin(), shape.end() - 3)));
+			return merged;
+		};
+		std::string probs = through_casts(n.inputs.at(0));
+		// PyTorch's SDPA export guards the probabilities with Where(IsNaN(p), 0, p): only a row whose every key is masked is NaN, and such
+		// rows are padding nothing reads (the fused kernel gives them finite values instead of zeros; see the fully-masked-row test).
+		if (const auto *w = made_by(probs); w && w->op_type == "Where" && w->inputs.size() == 3) {
+			const auto *isnan = made_by(w->inputs[0]);
+			double zero = 1.0;
+			if (isnan && isnan->op_type == "IsNaN" && isnan->inputs.size() == 1 && scalar_of(w->inputs[1], zero) && zero == 0.0 &&
+			    through_casts(w->inputs[2]) == through_casts(isnan->inputs[0])) {
+				probs = through_casts(w->inputs[2]);
+			}
+		}
+		const auto *sm = made_by(probs);
 		if (!sm || sm->op_type != "Softmax" || n.inputs.size() != 2) {
 			return nullptr;
 		}
 		const ShapeValue *sm_in = value(sm->inputs.at(0));
-		if (!sm_in || sm_in->shape.size() != 4) {
+		if (!sm_in || sm_in->shape.size() < 4 || sm_in->shape.size() > 5) {
 			return nullptr;
 		}
+		const int64_t sm_rank = static_cast<int64_t>(sm_in->shape.size());
 		const int64_t sm_axis = sm->Attr("axis") ? sm->Attr("axis")->i : -1;
-		if (sm_axis != -1 && sm_axis != 3) {
+		if (sm_axis != -1 && sm_axis != sm_rank - 1) {
 			return nullptr;
 		}
 		std::string scores = through_casts(sm->inputs[0]), mask;
 		if (const auto *add = made_by(scores); add && add->op_type == "Add" && add->inputs.size() == 2) {
 			for (int side = 0; side < 2 && mask.empty(); side++) {
-				if (is_f32_data(add->inputs[side]) && is_mask(add->inputs[side])) {
+				// a data mask, or one the shape pass knows on the host (built from shapes alone: tabfm-v1-1's Where(Less(Range..), 0, -max))
+				const ShapeValue *mv = value(add->inputs[side]);
+				const bool f32_mask = is_f32_data(add->inputs[side]) || (mv && mv->known && mv->dtype == ShapeDtype::F32);
+				if (f32_mask && is_mask(add->inputs[side])) {
 					mask = add->inputs[side];
 					scores = through_casts(add->inputs[1 - side]);
 				}
@@ -1897,23 +1959,25 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 		if (!is_f32_data(qn) || !is_f32_data(ktn) || !is_f32_data(vn)) {
 			return nullptr;
 		}
-		const Shape &qs = value(qn)->shape, &kts = value(ktn)->shape, &vs = value(vn)->shape;
-		if (qs.size() != 4 || kts.size() != 4 || vs.size() != 4) {
-			return nullptr;
+		const Shape &q_full = value(qn)->shape, &kt_full = value(ktn)->shape, &v_full = value(vn)->shape;
+		if (q_full.size() != static_cast<size_t>(sm_rank) || kt_full.size() != q_full.size() || v_full.size() != q_full.size() ||
+		    !std::equal(q_full.begin(), q_full.end() - 3, kt_full.begin()) || !std::equal(q_full.begin(), q_full.end() - 3, v_full.begin())) {
+			return nullptr; // the merged leading dimensions must be the same tensor's (no broadcast across them)
 		}
+		const Shape qs = as4(q_full), kts = as4(kt_full), vs = as4(v_full);
 		const int64_t B = qs[0], H = qs[1], S = qs[2], D = qs[3], SK = kts[3];
 		if (kts[0] != B || kts[1] != H || kts[2] != D || vs[0] != B || vs[1] != H || vs[2] != SK) {
 			return nullptr; // broadcast batch or head dimensions: left to the unfused lowering
 		}
 		const ShapeValue *out_value = value(n.outputs.at(0));
-		if (!out_value || out_value->shape != Shape {B, H, S, vs[3]}) {
+		if (!out_value || out_value->shape.size() != q_full.size() || as4(out_value->shape) != Shape {B, H, S, vs[3]}) {
 			return nullptr;
 		}
 		Shape ms; // the mask's shape right-aligned to four dimensions; checked before any tensor is created
 		if (!mask.empty()) {
 			ms = value(mask)->shape;
 			if (ms.size() > 4) {
-				return nullptr;
+				return nullptr; // a rank-5 mask would need its own merge: left to the unfused lowering
 			}
 			ms.insert(ms.begin(), 4 - ms.size(), 1);
 			if (ms[3] != SK || (ms[2] != 1 && ms[2] != S) || (ms[1] != 1 && ms[1] != H) || (ms[0] != 1 && ms[0] != B)) {
@@ -1993,27 +2057,107 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 		if (n.inputs.size() != 2) {
 			return nullptr;
 		}
-		const std::string m = other_than(&n, "Mul", 0.5, 0.0); // ... * 0.5
-		const auto *mul = made_by(m);
-		if (m.empty() || !mul || mul->op_type != "Mul" || mul->inputs.size() != 2) {
-			return nullptr;
-		}
-		for (int side = 0; side < 2; side++) { // x * (erf(x / sqrt 2) + 1), either order
-			const std::string &x = mul->inputs[side], &a = mul->inputs[1 - side];
+		// `a` is erf(x / sqrt 2) + 1 (either order)
+		auto erf_plus_one_of = [&](const std::string &a, const std::string &x) {
 			const std::string e = other_than(made_by(a), "Add", 1.0, 0.0);
 			const auto *erf = made_by(e);
 			if (e.empty() || !erf || erf->op_type != "Erf" || erf->inputs.size() != 1) {
-				continue;
+				return false;
 			}
 			const auto *div = made_by(erf->inputs[0]);
-			if (!div || div->op_type != "Div" || div->inputs.size() != 2 || div->inputs[0] != x || !scalar(div->inputs[1], std::sqrt(2.0), 1e-6)) {
-				continue;
-			}
+			return div && div->op_type == "Div" && div->inputs.size() == 2 && div->inputs[0] == x && scalar(div->inputs[1], std::sqrt(2.0), 1e-6);
+		};
+		auto gelu_of = [&](const std::string &x) -> ggml_tensor * {
 			const auto xv = low.shapes.find(x);
 			if (xv == low.shapes.end() || xv->second.known || xv->second.dtype != ShapeDtype::F32 || xv->second.shape != low.shapes.at(n.outputs.at(0)).shape) {
 				return nullptr;
 			}
 			return ggml_gelu_erf(ctx.get(), low.Contiguous(tensor_of(n, x)));
+		};
+		// (x * (erf(x / sqrt 2) + 1)) * 0.5, the half outside
+		const std::string m = other_than(&n, "Mul", 0.5, 0.0);
+		if (const auto *mul = made_by(m); !m.empty() && mul && mul->op_type == "Mul" && mul->inputs.size() == 2) {
+			for (int side = 0; side < 2; side++) {
+				if (erf_plus_one_of(mul->inputs[1 - side], mul->inputs[side])) {
+					return gelu_of(mul->inputs[side]);
+				}
+			}
+		}
+		// x * (0.5 * (erf(x / sqrt 2) + 1)), the half inside (kumo-tabular)
+		for (int side = 0; side < 2; side++) {
+			const std::string &x = n.inputs[side];
+			const std::string a = other_than(made_by(n.inputs[1 - side]), "Mul", 0.5, 0.0);
+			if (!a.empty() && erf_plus_one_of(a, x)) {
+				return gelu_of(x);
+			}
+		}
+		return nullptr;
+	};
+
+	// RMSNorm, as tabfm-v1-1 exports it: Mul(x, Reciprocal(Sqrt(Add(ReduceMean(Pow(x, 2), last axis, keepdims), eps)))) (either operand
+	// order). Spelled out it is five passes over the activations and a mean per row; ggml_rms_norm is one. On every backend.
+	auto fuse_rmsnorm = [&](const ::anofox::onnxread::Node &n) -> ggml_tensor * {
+		auto made_by = [&](const std::string &t) -> const ::anofox::onnxread::Node * {
+			const auto it = producer.find(t);
+			return it == producer.end() ? nullptr : it->second;
+		};
+		auto known_scalar = [&](const std::string &t, double &out) {
+			const auto it = low.shapes.find(t);
+			if (it == low.shapes.end() || !it->second.known || it->second.dtype != ShapeDtype::F32 || it->second.floats.size() != 1) {
+				return false;
+			}
+			out = it->second.floats[0];
+			return true;
+		};
+		if (n.inputs.size() != 2) {
+			return nullptr;
+		}
+		for (int side = 0; side < 2; side++) {
+			const std::string &x = n.inputs[side], &inv = n.inputs[1 - side];
+			const auto *rec = made_by(inv);
+			if (!rec || rec->op_type != "Reciprocal" || rec->inputs.size() != 1) {
+				continue;
+			}
+			const auto *sq = made_by(rec->inputs[0]);
+			if (!sq || sq->op_type != "Sqrt" || sq->inputs.size() != 1) {
+				continue;
+			}
+			const auto *add = made_by(sq->inputs[0]);
+			if (!add || add->op_type != "Add" || add->inputs.size() != 2) {
+				continue;
+			}
+			double eps = 0.0;
+			int mean_side = -1;
+			for (int a = 0; a < 2 && mean_side < 0; a++) {
+				const auto *m = made_by(add->inputs[a]);
+				if (m && m->op_type == "ReduceMean" && known_scalar(add->inputs[1 - a], eps)) {
+					mean_side = a;
+				}
+			}
+			if (mean_side < 0 || !(eps >= 0.0)) {
+				continue;
+			}
+			const auto *mean = made_by(add->inputs[mean_side]);
+			const auto *pw = made_by(mean->inputs.at(0));
+			double exponent = 0.0;
+			if (!pw || pw->op_type != "Pow" || pw->inputs.size() != 2 || pw->inputs[0] != x || !known_scalar(pw->inputs[1], exponent) ||
+			    exponent != 2.0) {
+				continue;
+			}
+			const auto xv = low.shapes.find(x);
+			if (xv == low.shapes.end() || xv->second.known || xv->second.dtype != ShapeDtype::F32 || xv->second.shape.empty() ||
+			    xv->second.shape != low.shapes.at(n.outputs.at(0)).shape) {
+				return nullptr;
+			}
+			// the mean over the last axis only, keeping it (its output is x's shape with the last dimension 1)
+			const auto mv = low.shapes.find(mean->outputs.at(0));
+			Shape want = xv->second.shape;
+			want.back() = 1;
+			const bool keepdims = !mean->Attr("keepdims") || mean->Attr("keepdims")->i != 0;
+			if (!keepdims || mv == low.shapes.end() || mv->second.shape != want || xv->second.shape.back() == 1) {
+				return nullptr;
+			}
+			return ggml_rms_norm(ctx.get(), low.Contiguous(tensor_of(n, x)), static_cast<float>(eps));
 		}
 		return nullptr;
 	};
@@ -2201,6 +2345,7 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 			      : op == "Log"  ? ggml_log(ctx.get(), x)
 			                     : ggml_tanh(ctx.get(), x);
 		} else if (op == "Mul" && (out = fuse_gelu(n)) != nullptr) {
+		} else if (op == "Mul" && (out = fuse_rmsnorm(n)) != nullptr) {
 			// the fused exact GELU (above)
 		} else if (op == "Add" || op == "Sub" || op == "Mul" || op == "Div") {
 			// Integers computed from float data live as floats; ONNX integer Div truncates toward zero.
@@ -2623,6 +2768,11 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 			}
 		} else if (op == "Where") {
 			out = elementwise(3, [&](std::vector<ggml_tensor *> &o, const Ne4 &ne) { return low.Custom(C_WHERE, o, ne); });
+		} else if (op == "ConstantOfShape") {
+			// The shape pass folds it on the host, except above its fold cap (a value too large to materialise there: kumo-tabular fills
+			// [1, features, rows, 3, 64]). The output's shape is still known, so it is filled here, on the device.
+			const Ne4 ne = ToStorage(n, out_shape);
+			out = ggml_fill_inplace(ctx.get(), ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]), ConstantOfShapeFill(n));
 		} else {
 			Fail(n, "op is not implemented in the ggml lowering");
 		}

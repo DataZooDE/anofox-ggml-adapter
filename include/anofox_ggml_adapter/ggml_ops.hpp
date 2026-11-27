@@ -43,7 +43,7 @@ inline const std::map<std::string, GgmlLowering> &GgmlLoweringTable() {
 	    {"Clip", {GgmlLowerKind::CUSTOM, "ggml_clamp is MAX(MIN(x,hi),lo), which turns NaN into hi, while ONNX Clip passes NaN through and the graphs mask with NaN; the bounds are folded constants, the kernel keeps NaN"}},
 	    {"Concat", {GgmlLowerKind::NATIVE, "ggml_concat along the (permuted) axis"}},
 	    {"Constant", {GgmlLowerKind::HOST, "folded into a constant tensor by the shape pass"}},
-	    {"ConstantOfShape", {GgmlLowerKind::HOST, "folded: the shape operand is known per input shape"}},
+	    {"ConstantOfShape", {GgmlLowerKind::HOST, "folded: the shape operand is known per input shape; above the fold cap filled on the device (ggml_fill)"}},
 	    {"Cos", {GgmlLowerKind::NATIVE, "ggml_cos"}},
 	    {"CumSum", {GgmlLowerKind::NATIVE, "ggml_cumsum along dim 0; other axes permute first"}},
 	    {"Div", {GgmlLowerKind::COMPOSITE, "ggml_div; ggml_repeat of the left operand when the right one is the larger. Float tensors only: the ggml CPU kernels abort on I32/I64, so integer arithmetic is HOST (folded) or a custom kernel."}},

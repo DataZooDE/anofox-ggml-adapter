@@ -1,0 +1,3 @@
+# op ConstantOfShape
+in x f32 3 bf12c39a be11076c 400a8b10
+out y f32 3 488646ee 488646fb 48864745

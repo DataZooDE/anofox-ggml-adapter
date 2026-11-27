@@ -960,7 +960,7 @@ TEST_CASE("ggml_lowering: scaled-dot-product attention fuses into one flash atte
 	};
 	for (const Want &w : {Want {"sdpa_band_keypad_tiled", 1}, Want {"sdpa_keypad_short_swapped", 1}, Want {"sdpa_no_mask", 1},
 	                      Want {"sdpa_float_bias_unfused", 0}, Want {"sdpa_shared_mask_two_query_lengths", 2},
-	                      Want {"sdpa_single_query_split_kv", 1}}) {
+	                      Want {"sdpa_single_query_split_kv", 1}, Want {"sdpa_rank5", 1}, Want {"sdpa_nan_guard", 1}, Want {"sdpa_known_mask", 1}}) {
 		const std::string stem = std::string("test/fixtures/ggml_ops/") + w.stem;
 		INFO("case " << w.stem);
 		const Case c = ReadCase(stem);
@@ -978,6 +978,25 @@ TEST_CASE("ggml_lowering: scaled-dot-product attention fuses into one flash atte
 			REQUIRE(fused == want);
 			REQUIRE(softmax == (want == 0 ? 1 : 0)); // the unfused chain is not computed next to the fused op
 		}
+	}
+}
+
+// RMSNorm spelled out (Pow, ReduceMean, Add eps, Sqrt, Reciprocal, Mul) is five passes over the activations and a mean: tabfm-v1-1 has
+// 341 of them. The lowering recognises the pattern and emits one ggml_rms_norm, on every backend.
+TEST_CASE("ggml_lowering: an exported RMSNorm fuses into one rms_norm", "[adapter][ggml][ggml_ops][rmsnorm]") {
+	const std::string stem = "test/fixtures/ggml_ops/rmsnorm_pattern";
+	const Case c = ReadCase(stem);
+	const auto graph = ReadGraph(stem);
+	for (const std::string device : {"cpu", "cpu-sched"}) {
+		INFO("device " << device);
+		GgmlExecutorConfig config;
+		config.threads = 3;
+		config.device = device;
+		GgmlExecutor executor(graph, config);
+		const auto ops = executor.GraphOpCounts(c.inputs, GgmlRunOptions {});
+		REQUIRE(ops.count("RMS_NORM"));
+		REQUIRE(ops.at("RMS_NORM") == 1);
+		REQUIRE(ops.count("MEAN") == 0); // the unfused chain is not computed next to the fused op
 	}
 }
 
@@ -1077,7 +1096,7 @@ TEST_CASE("ggml_lowering: the fused attention copies no activations around it", 
 TEST_CASE("ggml_lowering: the exact-GELU pattern lowers to one gelu_erf", "[adapter][ggml][ggml_ops][gelu]") {
 	// Five ops, three of them CPU-only custom kernels over the MLP activations, become one native unary op (multi-threaded on the CPU,
 	// on the device for the GPU plugins). The goldens above hold its values to ONNX Runtime's.
-	for (const char *stem : {"gelu_erf_pattern", "gelu_erf_pattern_swapped"}) {
+	for (const char *stem : {"gelu_erf_pattern", "gelu_erf_pattern_swapped", "gelu_erf_pattern_half_inside"}) {
 		const std::string path = std::string("test/fixtures/ggml_ops/") + stem;
 		const Case c = ReadCase(path);
 		const auto graph = ReadGraph(path);
