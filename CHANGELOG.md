@@ -16,6 +16,8 @@
   attentions per call ran unfused (their [heads, S, S] scores materialised). Golden: sdpa_nan_guard.
 - The attention fusion also accepts a 0/-max mask the shape pass knows on the host (built from shapes alone, as tabfm-v1-1's
   Where(Less(Range(..)), 0, -max)); it took only runtime masks. Golden: sdpa_known_mask.
+- The exact-GELU fusion also matches the half inside, x * (0.5 * (erf(x / sqrt 2) + 1)), as kumo-tabular exports it (29 per call ran
+  as Div, a custom Erf kernel, Add and two Mul). Golden: gelu_erf_pattern_half_inside.
 
 ## [2026.11.26]
 

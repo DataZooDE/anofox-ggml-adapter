@@ -2051,27 +2051,39 @@ std::unique_ptr<Compiled> CompileGraph(const ::anofox::onnxread::Graph &graph, c
 		if (n.inputs.size() != 2) {
 			return nullptr;
 		}
-		const std::string m = other_than(&n, "Mul", 0.5, 0.0); // ... * 0.5
-		const auto *mul = made_by(m);
-		if (m.empty() || !mul || mul->op_type != "Mul" || mul->inputs.size() != 2) {
-			return nullptr;
-		}
-		for (int side = 0; side < 2; side++) { // x * (erf(x / sqrt 2) + 1), either order
-			const std::string &x = mul->inputs[side], &a = mul->inputs[1 - side];
+		// `a` is erf(x / sqrt 2) + 1 (either order)
+		auto erf_plus_one_of = [&](const std::string &a, const std::string &x) {
 			const std::string e = other_than(made_by(a), "Add", 1.0, 0.0);
 			const auto *erf = made_by(e);
 			if (e.empty() || !erf || erf->op_type != "Erf" || erf->inputs.size() != 1) {
-				continue;
+				return false;
 			}
 			const auto *div = made_by(erf->inputs[0]);
-			if (!div || div->op_type != "Div" || div->inputs.size() != 2 || div->inputs[0] != x || !scalar(div->inputs[1], std::sqrt(2.0), 1e-6)) {
-				continue;
-			}
+			return div && div->op_type == "Div" && div->inputs.size() == 2 && div->inputs[0] == x && scalar(div->inputs[1], std::sqrt(2.0), 1e-6);
+		};
+		auto gelu_of = [&](const std::string &x) -> ggml_tensor * {
 			const auto xv = low.shapes.find(x);
 			if (xv == low.shapes.end() || xv->second.known || xv->second.dtype != ShapeDtype::F32 || xv->second.shape != low.shapes.at(n.outputs.at(0)).shape) {
 				return nullptr;
 			}
 			return ggml_gelu_erf(ctx.get(), low.Contiguous(tensor_of(n, x)));
+		};
+		// (x * (erf(x / sqrt 2) + 1)) * 0.5, the half outside
+		const std::string m = other_than(&n, "Mul", 0.5, 0.0);
+		if (const auto *mul = made_by(m); !m.empty() && mul && mul->op_type == "Mul" && mul->inputs.size() == 2) {
+			for (int side = 0; side < 2; side++) {
+				if (erf_plus_one_of(mul->inputs[1 - side], mul->inputs[side])) {
+					return gelu_of(mul->inputs[side]);
+				}
+			}
+		}
+		// x * (0.5 * (erf(x / sqrt 2) + 1)), the half inside (kumo-tabular)
+		for (int side = 0; side < 2; side++) {
+			const std::string &x = n.inputs[side];
+			const std::string a = other_than(made_by(n.inputs[1 - side]), "Mul", 0.5, 0.0);
+			if (!a.empty() && erf_plus_one_of(a, x)) {
+				return gelu_of(x);
+			}
 		}
 		return nullptr;
 	};
