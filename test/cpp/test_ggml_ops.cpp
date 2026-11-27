@@ -1286,3 +1286,41 @@ TEST_CASE("ggml_lowering: on Apple builds a weight matmul runs on Accelerate onl
 	REQUIRE(ops_for(8, 1) == std::make_pair(0, 1));                            // one output column: matrix-vector
 	REQUIRE(ops_for(1, 64) == std::make_pair(0, 1));                           // one activation row: vector-matrix
 }
+
+TEST_CASE("ggml_lowering: a batch-invariant executor gives every row the same bits however many rows share the call", "[adapter][ggml][ggml_ops][accelerate]") {
+	// anofox-tabfm promises the same answer for a row however the rows are batched. Accelerate's SGEMM (Apple builds) blocks by the row
+	// count, so a row's last bits depended on how many rows shared the call (tabfm_context_cache_kv.test, query_batch = 7, failed on
+	// macOS). GgmlExecutorConfig::batch_invariant keeps such paths off; ggml's own matmul is row-invariant.
+	::anofox::onnxread::Graph g;
+	g.inputs = {"x"};
+	::anofox::onnxread::Tensor w;
+	w.name = "w";
+	w.dims = {48, 40};
+	w.data_type = 1;
+	std::vector<float> wv(static_cast<size_t>(48 * 40));
+	for (size_t i = 0; i < wv.size(); i++) {
+		wv[i] = std::sin(0.37f * static_cast<float>(i)) * 0.5f;
+	}
+	w.raw.assign(reinterpret_cast<const char *>(wv.data()), wv.size() * sizeof(float));
+	g.initializers.push_back(w);
+	g.nodes = {MakeNode("MatMul", {"x", "w"}, "y")};
+	g.outputs = {"y"};
+	auto rows_of = [&](int64_t rows) {
+		std::vector<float> xv(static_cast<size_t>(rows * 48));
+		for (size_t i = 0; i < xv.size(); i++) {
+			xv[i] = std::cos(0.11f * static_cast<float>(i % (7 * 48)) + 0.3f * static_cast<float>(i / (7 * 48)));
+		}
+		HostTensors in;
+		in["x"] = HostTensor {{rows, 48}, xv};
+		GgmlExecutorConfig config;
+		config.threads = 3;
+		config.batch_invariant = true;
+		GgmlExecutor executor(g, config);
+		return executor.Run(in, GgmlRunOptions {}).at("y").data;
+	};
+	const auto seven = rows_of(7), forty_two = rows_of(42); // the first 7 rows are the same rows in both calls
+	for (size_t i = 0; i < seven.size(); i++) {
+		INFO("element " << i);
+		REQUIRE(std::memcmp(&seven[i], &forty_two[i], sizeof(float)) == 0);
+	}
+}
